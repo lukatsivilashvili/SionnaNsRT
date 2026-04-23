@@ -1,12 +1,17 @@
 import time
 import os
-import tensorflow as tf
-import numpy as np
 import socket
-from sionna.rt import load_scene, PlanarArray, Transmitter, Receiver, PathSolver
+import numpy as np
 from scipy.spatial import cKDTree
 import subprocess, signal
 import argparse
+import torch
+
+# Import sionna.rt before TensorFlow. Importing TensorFlow first can crash
+# Mitsuba/DrJit initialization on this Python 3.12 environment.
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+from sionna.rt import load_scene, PlanarArray, Transmitter, Receiver, PathSolver
 
 
 def manage_location_message(message, sionna_structure):
@@ -438,19 +443,17 @@ def configure_gpu(verbose=False, gpus=0):
     if os.getenv("CUDA_VISIBLE_DEVICES") is None:
         gpu_num = gpus
         os.environ["CUDA_VISIBLE_DEVICES"] = f"{gpu_num}"
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
+    cuda_available = torch.cuda.is_available()
+    if cuda_available:
         try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
+            torch.cuda.init()
         except RuntimeError as e:
             print(e)
 
-    tf.get_logger().setLevel('ERROR')
     if verbose:
-        print("Configured TensorFlow and GPU settings.")
+        visible = os.getenv("CUDA_VISIBLE_DEVICES", "<unset>")
+        print(f"Configured PyTorch runtime. CUDA_VISIBLE_DEVICES={visible}, cuda_available={cuda_available}")
 
 
 # Main function to manage initialization and variables
