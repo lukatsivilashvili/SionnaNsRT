@@ -1,11 +1,11 @@
 /*
  * Minimal proof-of-chain:
  *
- *   ns-3 UDP source -> Sionna-managed Wi-Fi hop -> ns-3 gateway
- *                   -> CSMA link -> ghost node -> Linux TAP
+ *   ns-3 UDP source UE -> Sionna-managed LTE hop -> eNB/EPC PGW
+ *                       -> CSMA link -> ghost node -> Linux TAP
  *
  * The TapBridge is deliberately attached to a separate CSMA device on the
- * ghost node, not directly to the Sionna-managed wireless device.
+ * ghost node, not directly to an LTE wireless device.
  */
 
 #include "ns3/applications-module.h"
@@ -13,12 +13,11 @@
 #include "ns3/csma-module.h"
 #include "ns3/flow-monitor-module.h"
 #include "ns3/internet-module.h"
-#include "ns3/ipv4-global-routing-helper.h"
+#include "ns3/lte-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/network-module.h"
 #include "ns3/sionna-helper.h"
 #include "ns3/tap-bridge-module.h"
-#include "ns3/wifi-module.h"
 
 #include <sstream>
 #include <string>
@@ -77,6 +76,8 @@ main(int argc, char* argv[])
     std::string tapMode = "ConfigureLocal";
     std::string tapName = "sionna-tap0";
     std::string flowMonitorFile = "sionna-ns3-to-linux-tap.flowmon.xml";
+    double txPower = 23.0;
+    uint16_t earfcn = 100;
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("enableTap", "Enable TapBridge egress to Linux", enableTap);
@@ -95,11 +96,13 @@ main(int argc, char* argv[])
     cmd.AddValue("trafficApp", "Traffic generator: UdpClient or OnOff", trafficApp);
     cmd.AddValue("port", "Destination UDP port", port);
     cmd.AddValue("simTime", "Simulation duration in seconds", simTime);
-    cmd.AddValue("distance", "Distance in meters between source and gateway wireless nodes", distance);
+    cmd.AddValue("distance", "Distance in meters between the LTE UE and eNB", distance);
     cmd.AddValue("maxPackets", "UDP client max packets; 0 derives from simTime/interval", maxPackets);
-    cmd.AddValue("enablePcap", "Enable Wi-Fi and CSMA pcap tracing", enablePcap);
+    cmd.AddValue("enablePcap", "Enable LTE and CSMA tracing", enablePcap);
     cmd.AddValue("enableFlowMonitor", "Write FlowMonitor XML output", enableFlowMonitor);
     cmd.AddValue("flowMonitorFile", "FlowMonitor XML output path", flowMonitorFile);
+    cmd.AddValue("txPower", "LTE UE/eNB TX power in dBm", txPower);
+    cmd.AddValue("earfcn", "LTE DL EARFCN; default 100 is near 2.1 GHz", earfcn);
     cmd.Parse(argc, argv);
 
     NS_ABORT_MSG_IF(tapMode != "ConfigureLocal" && tapMode != "UseLocal",
@@ -122,10 +125,12 @@ main(int argc, char* argv[])
         sionnaHelper.SetVerbose(sionnaVerbose);
     }
 
-    NodeContainer wirelessNodes;
-    wirelessNodes.Create(2);
-    Ptr<Node> sourceNode = wirelessNodes.Get(0);
-    Ptr<Node> gatewayNode = wirelessNodes.Get(1);
+    NodeContainer ueNodes;
+    NodeContainer enbNodes;
+    ueNodes.Create(1);
+    enbNodes.Create(1);
+    Ptr<Node> sourceNode = ueNodes.Get(0);
+    Ptr<Node> enbNode = enbNodes.Get(0);
 
     NodeContainer ghostNode;
     ghostNode.Create(1);
@@ -136,49 +141,46 @@ main(int argc, char* argv[])
     positions->Add(Vector(distance, 0.0, 1.5));
     mobility.SetPositionAllocator(positions);
     mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-    mobility.Install(wirelessNodes);
+    mobility.Install(ueNodes);
+    mobility.Install(enbNodes);
 
-    WifiHelper wifi;
-    wifi.SetStandard(WIFI_STANDARD_80211a);
-    wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
-                                 "DataMode",
-                                 StringValue("OfdmRate6Mbps"),
-                                 "ControlMode",
-                                 StringValue("OfdmRate6Mbps"));
+    Ptr<LteHelper> lteHelper = CreateObject<LteHelper>();
+    Ptr<PointToPointEpcHelper> epcHelper = CreateObject<PointToPointEpcHelper>();
+    lteHelper->SetEpcHelper(epcHelper);
+    lteHelper->SetEnbDeviceAttribute("DlEarfcn", UintegerValue(earfcn));
+    lteHelper->SetEnbDeviceAttribute("UlEarfcn", UintegerValue(earfcn + 18000));
 
-    WifiMacHelper wifiMac;
-    wifiMac.SetType("ns3::AdhocWifiMac");
+    Ptr<Node> pgwNode = epcHelper->GetPgwNode();
 
-    YansWifiChannelHelper wifiChannel;
-    wifiChannel.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
-    wifiChannel.AddPropagationLoss("ns3::FriisPropagationLossModel", "Frequency", DoubleValue(2.1e9));
+    NetDeviceContainer enbLteDevs = lteHelper->InstallEnbDevice(enbNodes);
+    NetDeviceContainer ueLteDevs = lteHelper->InstallUeDevice(ueNodes);
+    enbLteDevs.Get(0)->GetObject<LteEnbNetDevice>()->GetPhy()->SetTxPower(txPower);
+    ueLteDevs.Get(0)->GetObject<LteUeNetDevice>()->GetPhy()->SetTxPower(txPower);
 
-    YansWifiPhyHelper wifiPhy;
-    wifiPhy.SetChannel(wifiChannel.Create());
+    InternetStackHelper internet;
+    internet.Install(ueNodes);
+    internet.Install(ghostNode);
 
-    NetDeviceContainer wirelessDevices = wifi.Install(wifiPhy, wifiMac, wirelessNodes);
+    Ipv4InterfaceContainer ueIfaces = epcHelper->AssignUeIpv4Address(ueLteDevs);
 
-    NodeContainer wiredNodes(gatewayNode, ghostNode.Get(0));
+    Ipv4StaticRoutingHelper ipv4RoutingHelper;
+    Ptr<Ipv4StaticRouting> ueStaticRouting =
+        ipv4RoutingHelper.GetStaticRouting(sourceNode->GetObject<Ipv4>());
+    ueStaticRouting->SetDefaultRoute(epcHelper->GetUeDefaultGatewayAddress(), 1);
+
+    lteHelper->Attach(ueLteDevs.Get(0), enbLteDevs.Get(0));
+
+    NodeContainer wiredNodes(pgwNode, ghostNode.Get(0));
     CsmaHelper csma;
     csma.SetChannelAttribute("DataRate", DataRateValue(DataRate("100Mbps")));
     csma.SetChannelAttribute("Delay", TimeValue(MilliSeconds(1)));
     NetDeviceContainer wiredDevices = csma.Install(wiredNodes);
 
-    InternetStackHelper internet;
-    internet.Install(sourceNode);
-    internet.Install(gatewayNode);
-    internet.Install(ghostNode);
-
-    Ipv4AddressHelper wirelessIpv4;
-    wirelessIpv4.SetBase("10.10.1.0", "255.255.255.0");
-    Ipv4InterfaceContainer wirelessIfaces = wirelessIpv4.Assign(wirelessDevices);
-
     Ipv4AddressHelper wiredIpv4;
     wiredIpv4.SetBase("10.10.2.0", "255.255.255.0");
     Ipv4InterfaceContainer wiredIfaces = wiredIpv4.Assign(wiredDevices);
 
-    const Ipv4Address sourceIp = wirelessIfaces.GetAddress(0);
-    const Ipv4Address gatewayWirelessIp = wirelessIfaces.GetAddress(1);
+    const Ipv4Address sourceIp = ueIfaces.GetAddress(0);
     const Ipv4Address gatewayWiredIp = wiredIfaces.GetAddress(0);
     const Ipv4Address destinationIp = wiredIfaces.GetAddress(1);
 
@@ -195,8 +197,6 @@ main(int argc, char* argv[])
         }
         tapBridge.Install(ghostNode.Get(0), wiredDevices.Get(1));
     }
-
-    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
     const Time packetInterval = Time(interval);
     if (maxPackets == 0)
@@ -261,19 +261,22 @@ main(int argc, char* argv[])
 
     if (enablePcap)
     {
-        wifiPhy.EnablePcap("sionna-ns3-to-linux-tap-wireless", wirelessDevices);
+        lteHelper->EnablePhyTraces();
+        lteHelper->EnableMacTraces();
+        lteHelper->EnableRlcTraces();
         csma.EnablePcap("sionna-ns3-to-linux-tap-csma", wiredDevices, false);
     }
 
-    NS_LOG_UNCOND("Sionna ns-3 to Linux TAP proof-of-chain");
+    NS_LOG_UNCOND("Sionna LTE ns-3 to Linux TAP proof-of-chain");
     NS_LOG_UNCOND("  source nodeId=" << sourceNode->GetId() << " Sionna object=car_1"
                                       << " position="
                                       << PositionToString(sourceNode->GetObject<MobilityModel>()->GetPosition()));
-    NS_LOG_UNCOND("  gateway nodeId=" << gatewayNode->GetId() << " Sionna object=car_2"
-                                       << " position="
-                                       << PositionToString(gatewayNode->GetObject<MobilityModel>()->GetPosition()));
-    NS_LOG_UNCOND("  source IP=" << sourceIp << " gateway wireless IP=" << gatewayWirelessIp);
-    NS_LOG_UNCOND("  gateway wired IP=" << gatewayWiredIp << " destination IP=" << destinationIp);
+    NS_LOG_UNCOND("  eNB nodeId=" << enbNode->GetId() << " Sionna object=car_2"
+                                  << " position="
+                                  << PositionToString(enbNode->GetObject<MobilityModel>()->GetPosition()));
+    NS_LOG_UNCOND("  UE IP=" << sourceIp << " EPC default gateway="
+                             << epcHelper->GetUeDefaultGatewayAddress());
+    NS_LOG_UNCOND("  PGW wired IP=" << gatewayWiredIp << " destination IP=" << destinationIp);
     NS_LOG_UNCOND("  UDP destination=" << destinationIp << ":" << port
                                        << " app=" << trafficApp
                                        << " packetSize=" << packetSize

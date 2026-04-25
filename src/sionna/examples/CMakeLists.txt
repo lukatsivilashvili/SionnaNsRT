@@ -21,7 +21,7 @@ if(${ENABLE_TAP})
       ${libnetwork}
       ${libinternet}
       ${libmobility}
-      ${libwifi}
+      ${liblte}
       ${libcsma}
       ${libtap-bridge}
       ${libapplications}
