@@ -10,3 +10,25 @@ build_lib_example(
     ${libmobility}
     ${libapplications}
 )
+
+if(${ENABLE_TAP})
+  build_lib_example(
+    NAME sionna-ns3-to-linux-tap
+    SOURCE_FILES sionna-ns3-to-linux-tap.cc
+    LIBRARIES_TO_LINK
+      ${libsionna}
+      ${libcore}
+      ${libnetwork}
+      ${libinternet}
+      ${libmobility}
+      ${libwifi}
+      ${libcsma}
+      ${libtap-bridge}
+      ${libapplications}
+      ${libflow-monitor}
+  )
+
+  if(TARGET sionna-ns3-to-linux-tap AND TARGET tap-creator)
+    add_dependencies(sionna-ns3-to-linux-tap tap-creator)
+  endif()
+endif()

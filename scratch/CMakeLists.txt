@@ -99,3 +99,10 @@ foreach(subdir ${scratch_subdirectories})
     create_scratch("${scratch_sources}")
   endif()
 endforeach()
+
+# Scratch examples that use TapBridge in ConfigureLocal mode need the helper
+# executable built as part of the target, otherwise ./ns3 run <scratch>
+# reaches runtime before ns3-dev-tap-creator-debug exists.
+if(TARGET scratch_sionna-tap-egress AND TARGET tap-creator)
+  add_dependencies(scratch_sionna-tap-egress tap-creator)
+endif()
