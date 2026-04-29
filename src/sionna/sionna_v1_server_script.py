@@ -1,6 +1,8 @@
 import time
 import os
 import socket
+import json
+import csv
 import numpy as np
 from scipy.spatial import cKDTree
 import subprocess, signal
@@ -11,7 +13,552 @@ import torch
 # Mitsuba/DrJit initialization on this Python 3.12 environment.
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
-from sionna.rt import load_scene, PlanarArray, Transmitter, Receiver, PathSolver
+from sionna.rt import load_scene, PlanarArray, Transmitter, Receiver, PathSolver, RadioMapSolver, Camera
+
+
+def tensor_to_numpy(value):
+    if hasattr(value, "numpy"):
+        return value.numpy()
+    return np.array(value)
+
+
+def json_safe(value):
+    """Convert Sionna/Mitsuba/NumPy values into JSON-native values."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return json_safe(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    if hasattr(value, "numpy"):
+        return json_safe(value.numpy())
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def scalar_float(value):
+    value = json_safe(value)
+    if isinstance(value, list):
+        if not value:
+            raise ValueError("Cannot convert empty list to scalar float")
+        value = value[0]
+    return float(value)
+
+
+def ensure_antennas(sionna_structure):
+    sionna_structure["scene"].tx_array = sionna_structure["planar_array"]
+    sionna_structure["scene"].rx_array = sionna_structure["planar_array"]
+
+    for car_id in sionna_structure["sionna_location_db"]:
+        tx_antenna_name = f"car_{car_id}_tx_antenna"
+        rx_antenna_name = f"car_{car_id}_rx_antenna"
+        car_position = np.array(
+            [sionna_structure["sionna_location_db"][car_id]['x'], sionna_structure["sionna_location_db"][car_id]['y'],
+             sionna_structure["sionna_location_db"][car_id]['z']])
+        tx_position = car_position + np.array(sionna_structure["antenna_displacement"])
+        rx_position = car_position + np.array(sionna_structure["antenna_displacement"])
+
+        if sionna_structure["scene"].get(tx_antenna_name) is None:
+            sionna_structure["scene"].add(Transmitter(tx_antenna_name, position=tx_position, orientation=[0, 0, 0]))
+            if sionna_structure["verbose"]:
+                print(f"Added TX antenna for car_{car_id}: {tx_antenna_name}")
+        else:
+            sionna_structure["scene"].get(tx_antenna_name).position = tx_position
+
+        if sionna_structure["scene"].get(rx_antenna_name) is None:
+            sionna_structure["scene"].add(Receiver(rx_antenna_name, position=rx_position, orientation=[0, 0, 0]))
+            if sionna_structure["verbose"]:
+                print(f"Added RX antenna for car_{car_id}: {rx_antenna_name}")
+        else:
+            sionna_structure["scene"].get(rx_antenna_name).position = rx_position
+
+
+def position_signature(sionna_structure, car_ids):
+    signature = []
+    for car_id in car_ids:
+        position = sionna_structure["sionna_location_db"].get(car_id)
+        if position is None:
+            return None
+        signature.append((
+            car_id,
+            round(float(position["x"]), 3),
+            round(float(position["y"]), 3),
+            round(float(position["z"]), 3),
+        ))
+    return tuple(signature)
+
+
+def position_to_array(position):
+    return np.array([float(position["x"]), float(position["y"]), float(position["z"])])
+
+
+def radio_map_camera_for_positions(sionna_structure, tx_pos, rx_pos):
+    if sionna_structure["radio_map_camera_mode"] == "fixed":
+        return (
+            list(sionna_structure["radio_map_camera_position"]),
+            list(sionna_structure["radio_map_camera_look_at"]),
+        )
+
+    tx_array = position_to_array(tx_pos)
+    rx_array = position_to_array(rx_pos)
+
+    link_xy = rx_array[:2] - tx_array[:2]
+    link_distance = np.linalg.norm(link_xy)
+    if link_distance > 1e-6:
+        link_direction = np.array([link_xy[0], link_xy[1], 0.0]) / link_distance
+        side_direction = np.array([-link_direction[1], link_direction[0], 0.0])
+        target_weight = sionna_structure["radio_map_camera_rx_target_weight"]
+        target = tx_array * (1.0 - target_weight) + rx_array * target_weight
+        camera_distance = max(
+            sionna_structure["radio_map_camera_rx_distance"],
+            link_distance * sionna_structure["radio_map_camera_distance_scale"],
+        )
+        camera_height = max(
+            sionna_structure["radio_map_camera_height"],
+            link_distance * sionna_structure["radio_map_camera_height_scale"],
+        )
+        camera_position = (
+            target
+            + link_direction * camera_distance
+            + side_direction * sionna_structure["radio_map_camera_side_offset"]
+        )
+        camera_position[2] = target[2] + camera_height
+    else:
+        offset = np.array(sionna_structure["radio_map_camera_rx_offset"])
+        camera_position = rx_array + offset
+
+    target_weight = sionna_structure["radio_map_camera_rx_target_weight"]
+    look_at = tx_array * (1.0 - target_weight) + rx_array * target_weight
+    look_at[2] = sionna_structure["radio_map_camera_look_at_height"]
+
+    return camera_position.tolist(), look_at.tolist()
+
+
+def min_cached_delay_seconds(sionna_structure, tx_car_id, rx_car_id):
+    source_key = f"car_{tx_car_id}"
+    target_key = f"car_{rx_car_id}"
+    cached = sionna_structure["rays_cache"].get(source_key, {}).get(target_key)
+    if not cached:
+        return None
+
+    values = []
+    for delay_set in cached.get("delays", []):
+        delay_array = np.asarray(delay_set).reshape(-1)
+        delay_array = delay_array[np.isfinite(delay_array) & (delay_array >= 0.0)]
+        if delay_array.size:
+            values.append(float(np.min(delay_array)))
+
+    if not values:
+        return None
+    return min(values)
+
+
+def cached_los_status(sionna_structure, tx_car_id, rx_car_id):
+    source_key = f"car_{tx_car_id}"
+    target_key = f"car_{rx_car_id}"
+    cached = sionna_structure["rays_cache"].get(source_key, {}).get(target_key)
+    if not cached:
+        return None
+    los_values = cached.get("is_los", [])
+    if not los_values:
+        return None
+    return bool(np.any(los_values))
+
+
+def create_radio_map_stats_plot(
+        stats_path,
+        path_gain_db,
+        centers,
+        tx_pos,
+        rx_pos,
+        tx_name,
+        rx_name,
+        metrics):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    tx_xy = np.array([float(tx_pos["x"]), float(tx_pos["y"])])
+    rx_xy = np.array([float(rx_pos["x"]), float(rx_pos["y"])])
+    link_xy = rx_xy - tx_xy
+    link_distance = np.linalg.norm(link_xy)
+    flat_gain = path_gain_db.reshape(-1)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.2), gridspec_kw={"width_ratios": [1.6, 1.0]})
+
+    center_xy = centers[:, :, :2].reshape(-1, 2)
+    if link_distance > 1e-6:
+        direction = link_xy / link_distance
+        sample_distances = np.linspace(0.0, link_distance, 80)
+        sample_points = tx_xy + sample_distances[:, None] * direction
+        _, nearest_indices = cKDTree(center_xy).query(sample_points)
+        gain_profile = flat_gain[nearest_indices]
+        axes[0].plot(sample_distances, gain_profile, color="#2f7ed8", linewidth=2.0)
+        axes[0].scatter([0.0], [gain_profile[0]], color="#333333", s=45, zorder=3, label="TX")
+        axes[0].scatter([link_distance], [metrics["rx_path_gain_db"]], color="#d62728", s=60, zorder=3, label="RX")
+        axes[0].set_title("Path Gain Along TX-RX Line")
+        axes[0].legend(loc="best")
+        axes[0].set_xlim(0.0, link_distance)
+    else:
+        axes[0].text(0.5, 0.5, "TX/RX overlap", ha="center", va="center")
+        axes[0].set_title("Path Gain Toward RX")
+    axes[0].set_xlabel("Distance from TX (m)")
+    axes[0].set_ylabel("Mean path gain (dB)")
+    axes[0].grid(True, alpha=0.25)
+
+    ray_delay = metrics["ray_one_way_delay_s"]
+    ray_rtt = metrics["ray_rtt_s"]
+    los_status = metrics["los_status"]
+
+    summary_lines = [
+        f"TX: {tx_name}",
+        f"  ({float(tx_pos['x']):.1f}, {float(tx_pos['y']):.1f}, {float(tx_pos['z']):.1f})",
+        f"RX: {rx_name}",
+        f"  ({float(rx_pos['x']):.1f}, {float(rx_pos['y']):.1f}, {float(rx_pos['z']):.1f})",
+        "",
+        f"Distance: {metrics['tx_rx_distance_3d_m']:.1f} m",
+        f"LOS: {'unknown' if los_status is None else los_status}",
+        "",
+        f"Path gain: {metrics['rx_path_gain_db']:.1f} dB",
+        f"Path loss: {metrics['rx_path_loss_db']:.1f} dB",
+        f"RX power:  {metrics['rx_power_dbm']:.1f} dBm",
+        f"SNR:       {metrics['snr_db']:.1f} dB",
+        "",
+        f"Geom RTT: {metrics['geometric_rtt_s'] * 1e9:.1f} ns",
+        f"Ray RTT: {'n/a' if ray_rtt is None else f'{ray_rtt * 1e9:.1f} ns'}",
+        "",
+        f"Map gain mean: {metrics['path_gain_mean_db']:.1f} dB",
+        f"Map loss mean: {metrics['path_loss_mean_db']:.1f} dB",
+    ]
+    axes[1].axis("off")
+    axes[1].text(0.0, 0.98, "\n".join(summary_lines), va="top", family="monospace", fontsize=10.5)
+    axes[1].set_title("Key Metrics")
+
+    fig.tight_layout()
+    fig.savefig(stats_path, dpi=160)
+    plt.close(fig)
+
+
+def write_radio_map_summary(row, sionna_structure):
+    csv_path = sionna_structure["radio_map_summary_csv"]
+    if csv_path is None:
+        csv_path = os.path.join(sionna_structure["radio_map_dir"], "radio_map_summary.csv")
+
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    fieldnames = [
+        "index",
+        "tx_name",
+        "rx_name",
+        "tx_x",
+        "tx_y",
+        "tx_z",
+        "rx_x",
+        "rx_y",
+        "rx_z",
+        "frequency_hz",
+        "bandwidth_hz",
+        "cell_size_x_m",
+        "cell_size_y_m",
+        "samples_per_tx",
+        "max_depth",
+        "rx_nearest_path_gain_db",
+        "rx_path_loss_db",
+        "tx_power_dbm",
+        "rx_power_dbm",
+        "noise_figure_db",
+        "noise_floor_dbm",
+        "snr_db",
+        "path_gain_min_db",
+        "path_gain_mean_db",
+        "path_gain_max_db",
+        "path_loss_min_db",
+        "path_loss_mean_db",
+        "path_loss_max_db",
+        "tx_rx_distance_m",
+        "tx_rx_distance_2d_m",
+        "geometric_one_way_delay_s",
+        "geometric_rtt_s",
+        "ray_one_way_delay_s",
+        "ray_rtt_s",
+        "los_status",
+        "camera_mode",
+        "camera_x",
+        "camera_y",
+        "camera_z",
+        "look_at_x",
+        "look_at_y",
+        "look_at_z",
+        "scene_png",
+        "grid_png",
+        "stats_png",
+        "path_gain_db_npy",
+        "metadata_json",
+    ]
+
+    write_header = not sionna_structure["radio_map_summary_csv_initialized"]
+    mode = "w" if write_header else "a"
+    with open(csv_path, mode, encoding="utf-8", newline="") as summary_file:
+        writer = csv.DictWriter(summary_file, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({key: json_safe(row.get(key, "")) for key in fieldnames})
+    sionna_structure["radio_map_summary_csv_initialized"] = True
+
+    return csv_path
+
+
+def export_radio_map_if_needed(sionna_structure):
+    if not sionna_structure["export_radio_map"]:
+        return
+
+    tx_car_id = sionna_structure["radio_map_tx_car_id"]
+    rx_car_id = sionna_structure["radio_map_rx_car_id"]
+    signature = position_signature(sionna_structure, [tx_car_id, rx_car_id])
+    if signature is None or signature in sionna_structure["exported_radio_map_signatures"]:
+        return
+
+    tx_name = f"car_{tx_car_id}_tx_antenna"
+    rx_name = f"car_{rx_car_id}_rx_antenna"
+
+    ensure_antennas(sionna_structure)
+
+    scene = sionna_structure["scene"]
+    tx_names = list(scene.transmitters.keys())
+    if tx_name not in tx_names:
+        print(f"Radio map export skipped: no transmitter {tx_name} in scene.")
+        return
+
+    tx_index = tx_names.index(tx_name)
+    out_dir = sionna_structure["radio_map_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+
+    export_index = len(sionna_structure["exported_radio_map_signatures"])
+    basename = f"radio_map_{export_index:03d}_tx_{tx_name}_rx_{rx_name}"
+
+    print(f"Computing radio map {basename}...")
+    t = time.time()
+    radio_map = sionna_structure["radio_map_solver"](
+        scene=scene,
+        center=sionna_structure["radio_map_center"],
+        orientation=None,
+        size=sionna_structure["radio_map_size"],
+        cell_size=sionna_structure["radio_map_cell_size"],
+        samples_per_tx=sionna_structure["radio_map_samples"],
+        max_depth=sionna_structure["max_depth"],
+        los=sionna_structure["los"],
+        specular_reflection=sionna_structure["specular_reflection"],
+        diffuse_reflection=sionna_structure["diffuse_reflection"],
+        refraction=sionna_structure["refraction"],
+        seed=sionna_structure["seed"],
+    )
+
+    path_gain = tensor_to_numpy(radio_map.transmitter_radio_map(metric="path_gain", tx=tx_index))
+    path_gain = np.squeeze(path_gain)
+    path_gain_db = 10.0 * np.log10(np.maximum(path_gain, 1e-30))
+    centers = tensor_to_numpy(radio_map.cell_centers)
+
+    npy_path = os.path.join(out_dir, basename + "_path_gain_db.npy")
+    scene_png_path = os.path.join(out_dir, basename + "_scene.png")
+    grid_png_path = os.path.join(out_dir, basename + "_grid.png")
+    stats_png_path = os.path.join(out_dir, basename + "_stats.png")
+    json_path = os.path.join(out_dir, basename + ".json")
+    np.save(npy_path, path_gain_db)
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    x = centers[:, :, 0]
+    y = centers[:, :, 1]
+    extent = [float(np.nanmin(x)), float(np.nanmax(x)), float(np.nanmin(y)), float(np.nanmax(y))]
+
+    tx_pos = sionna_structure["sionna_location_db"][tx_car_id]
+    rx_pos = sionna_structure["sionna_location_db"][rx_car_id]
+
+    plt.figure(figsize=(10, 8))
+    image = plt.imshow(path_gain_db, origin="lower", extent=extent, cmap="viridis", aspect="equal")
+    plt.colorbar(image, label="Path gain (dB)")
+    plt.scatter([tx_pos["x"]], [tx_pos["y"]], marker="^", c="red", s=90, label=f"TX {tx_name}")
+    plt.scatter([rx_pos["x"]], [rx_pos["y"]], marker="o", c="white", edgecolors="black", s=80, label=f"RX {rx_name}")
+    plt.xlabel("x [m]")
+    plt.ylabel("y [m]")
+    plt.title(f"Sionna RT radio map: {tx_name} -> {rx_name}")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(grid_png_path, dpi=160)
+    plt.close()
+
+    if sionna_structure["radio_map_render_scene"]:
+        camera_position, camera_look_at = radio_map_camera_for_positions(sionna_structure, tx_pos, rx_pos)
+        camera = Camera(
+            position=camera_position,
+            look_at=camera_look_at,
+        )
+        scene.render_to_file(
+            camera=camera,
+            filename=scene_png_path,
+            radio_map=radio_map,
+            resolution=tuple(sionna_structure["radio_map_resolution"]),
+            num_samples=sionna_structure["radio_map_render_samples"],
+            rm_tx=tx_index,
+            rm_metric="path_gain",
+            rm_db_scale=True,
+            rm_vmin=sionna_structure["radio_map_vmin"],
+            rm_vmax=sionna_structure["radio_map_vmax"],
+            fov=sionna_structure["radio_map_camera_fov"],
+            show_devices=True,
+            show_orientations=sionna_structure["radio_map_show_orientations"],
+        )
+    else:
+        scene_png_path = ""
+        camera_position, camera_look_at = radio_map_camera_for_positions(sionna_structure, tx_pos, rx_pos)
+
+    rx_xy = np.array([float(rx_pos["x"]), float(rx_pos["y"])])
+    tx_xy = np.array([float(tx_pos["x"]), float(tx_pos["y"])])
+    tx_array = position_to_array(tx_pos)
+    rx_array = position_to_array(rx_pos)
+    tx_rx_distance_2d = float(np.linalg.norm(rx_xy - tx_xy))
+    tx_rx_distance = float(np.linalg.norm(rx_array - tx_array))
+    center_xy = centers[:, :, :2].reshape(-1, 2)
+    nearest_cell_index = int(np.argmin(np.linalg.norm(center_xy - rx_xy, axis=1)))
+    rx_nearest_path_gain_db = float(path_gain_db.reshape(-1)[nearest_cell_index])
+    rx_path_loss_db = -rx_nearest_path_gain_db
+    tx_power_dbm = sionna_structure["radio_map_tx_power_dbm"]
+    rx_power_dbm = tx_power_dbm + rx_nearest_path_gain_db
+    frequency_hz = scalar_float(sionna_structure["scene"].frequency)
+    bandwidth_hz = scalar_float(sionna_structure["scene"].bandwidth)
+    noise_floor_dbm = -174.0 + 10.0 * np.log10(bandwidth_hz) + sionna_structure["radio_map_noise_figure_db"]
+    snr_db = rx_power_dbm - noise_floor_dbm
+    speed_of_light = 299792458.0
+    geometric_one_way_delay_s = tx_rx_distance / speed_of_light
+    geometric_rtt_s = 2.0 * geometric_one_way_delay_s
+    ray_one_way_delay_s = min_cached_delay_seconds(sionna_structure, tx_car_id, rx_car_id)
+    ray_rtt_s = None if ray_one_way_delay_s is None else 2.0 * ray_one_way_delay_s
+    los_status = cached_los_status(sionna_structure, tx_car_id, rx_car_id)
+    metrics = {
+        "tx_rx_distance_3d_m": tx_rx_distance,
+        "tx_rx_distance_2d_m": tx_rx_distance_2d,
+        "rx_path_gain_db": rx_nearest_path_gain_db,
+        "rx_path_loss_db": rx_path_loss_db,
+        "tx_power_dbm": tx_power_dbm,
+        "rx_power_dbm": rx_power_dbm,
+        "noise_figure_db": sionna_structure["radio_map_noise_figure_db"],
+        "noise_floor_dbm": noise_floor_dbm,
+        "snr_db": snr_db,
+        "path_gain_min_db": float(np.nanmin(path_gain_db)),
+        "path_gain_mean_db": float(np.nanmean(path_gain_db)),
+        "path_gain_max_db": float(np.nanmax(path_gain_db)),
+        "path_loss_min_db": float(np.nanmin(-path_gain_db)),
+        "path_loss_mean_db": float(np.nanmean(-path_gain_db)),
+        "path_loss_max_db": float(np.nanmax(-path_gain_db)),
+        "geometric_one_way_delay_s": geometric_one_way_delay_s,
+        "geometric_rtt_s": geometric_rtt_s,
+        "ray_one_way_delay_s": ray_one_way_delay_s,
+        "ray_rtt_s": ray_rtt_s,
+        "los_status": los_status,
+    }
+
+    if sionna_structure["radio_map_export_stats_plot"]:
+        create_radio_map_stats_plot(
+            stats_png_path,
+            path_gain_db,
+            centers,
+            tx_pos,
+            rx_pos,
+            tx_name,
+            rx_name,
+            metrics,
+        )
+    else:
+        stats_png_path = ""
+
+    metadata = {
+        "tx": {"name": tx_name, "position": tx_pos},
+        "rx": {"name": rx_name, "position": rx_pos},
+        "tx_rx_distance_m": tx_rx_distance,
+        "tx_rx_distance_2d_m": tx_rx_distance_2d,
+        "frequency_hz": frequency_hz,
+        "bandwidth_hz": bandwidth_hz,
+        "tx_power_dbm": tx_power_dbm,
+        "noise_figure_db": sionna_structure["radio_map_noise_figure_db"],
+        "cell_size": list(sionna_structure["radio_map_cell_size"]),
+        "size": None if sionna_structure["radio_map_size"] is None else list(sionna_structure["radio_map_size"]),
+        "center": None if sionna_structure["radio_map_center"] is None else list(sionna_structure["radio_map_center"]),
+        "samples_per_tx": sionna_structure["radio_map_samples"],
+        "path_gain_db_npy": npy_path,
+        "scene_png": scene_png_path,
+        "grid_png": grid_png_path,
+        "stats_png": stats_png_path,
+        "camera_mode": sionna_structure["radio_map_camera_mode"],
+        "camera_position": camera_position,
+        "camera_look_at": camera_look_at,
+        "metrics": metrics,
+    }
+    with open(json_path, "w", encoding="utf-8") as metadata_file:
+        json.dump(json_safe(metadata), metadata_file, indent=2)
+
+    csv_path = write_radio_map_summary(
+        {
+            "index": export_index,
+            "tx_name": tx_name,
+            "rx_name": rx_name,
+            "tx_x": tx_pos["x"],
+            "tx_y": tx_pos["y"],
+            "tx_z": tx_pos["z"],
+            "rx_x": rx_pos["x"],
+            "rx_y": rx_pos["y"],
+            "rx_z": rx_pos["z"],
+            "frequency_hz": frequency_hz,
+            "bandwidth_hz": bandwidth_hz,
+            "cell_size_x_m": sionna_structure["radio_map_cell_size"][0],
+            "cell_size_y_m": sionna_structure["radio_map_cell_size"][1],
+            "samples_per_tx": sionna_structure["radio_map_samples"],
+            "max_depth": sionna_structure["max_depth"],
+            "rx_nearest_path_gain_db": rx_nearest_path_gain_db,
+            "rx_path_loss_db": rx_path_loss_db,
+            "tx_power_dbm": tx_power_dbm,
+            "rx_power_dbm": rx_power_dbm,
+            "noise_figure_db": sionna_structure["radio_map_noise_figure_db"],
+            "noise_floor_dbm": noise_floor_dbm,
+            "snr_db": snr_db,
+            "path_gain_min_db": metrics["path_gain_min_db"],
+            "path_gain_mean_db": metrics["path_gain_mean_db"],
+            "path_gain_max_db": metrics["path_gain_max_db"],
+            "path_loss_min_db": metrics["path_loss_min_db"],
+            "path_loss_mean_db": metrics["path_loss_mean_db"],
+            "path_loss_max_db": metrics["path_loss_max_db"],
+            "tx_rx_distance_m": tx_rx_distance,
+            "tx_rx_distance_2d_m": tx_rx_distance_2d,
+            "geometric_one_way_delay_s": geometric_one_way_delay_s,
+            "geometric_rtt_s": geometric_rtt_s,
+            "ray_one_way_delay_s": ray_one_way_delay_s,
+            "ray_rtt_s": ray_rtt_s,
+            "los_status": los_status,
+            "camera_mode": sionna_structure["radio_map_camera_mode"],
+            "camera_x": camera_position[0],
+            "camera_y": camera_position[1],
+            "camera_z": camera_position[2],
+            "look_at_x": camera_look_at[0],
+            "look_at_y": camera_look_at[1],
+            "look_at_z": camera_look_at[2],
+            "scene_png": scene_png_path,
+            "grid_png": grid_png_path,
+            "stats_png": stats_png_path,
+            "path_gain_db_npy": npy_path,
+            "metadata_json": json_path,
+        },
+        sionna_structure,
+    )
+
+    sionna_structure["exported_radio_map_signatures"].add(signature)
+    print(f"Saved radio map to {scene_png_path or grid_png_path} in {(time.time() - t):.2f}s")
+    print(f"Updated radio map summary CSV: {csv_path}")
 
 
 def manage_location_message(message, sionna_structure):
@@ -90,7 +637,8 @@ def manage_location_message(message, sionna_structure):
                 if sionna_structure["verbose"]: 
                     print(f"Updated car_{car} position in the scene.")
             else:
-                print(f"ERROR: no car_{car} in the scene, use Blender to check")
+                if sionna_structure["verbose"]:
+                    print(f"No car_{car} mesh in the scene; antenna markers will be positioned from LOC_UPDATE.")
 
             sionna_structure["scene"].remove(f"car_{car}_tx_antenna")
             sionna_structure["scene"].remove(f"car_{car}_rx_antenna")
@@ -183,30 +731,7 @@ def match_rays_to_cars(paths, sionna_structure):
 def compute_rays(sionna_structure):
     t = time.time()
 
-    sionna_structure["scene"].tx_array = sionna_structure["planar_array"]
-    sionna_structure["scene"].rx_array = sionna_structure["planar_array"]
-
-    # Ensure every car in the simulation has antennas (one for TX and one for RX)
-    for car_id in sionna_structure["sionna_location_db"]:
-        tx_antenna_name = f"car_{car_id}_tx_antenna"
-        rx_antenna_name = f"car_{car_id}_rx_antenna"
-        car_position = np.array(
-            [sionna_structure["sionna_location_db"][car_id]['x'], sionna_structure["sionna_location_db"][car_id]['y'],
-             sionna_structure["sionna_location_db"][car_id]['z']])
-        tx_position = car_position + np.array(sionna_structure["antenna_displacement"])
-        rx_position = car_position + np.array(sionna_structure["antenna_displacement"])
-
-        if sionna_structure["scene"].get(tx_antenna_name) is None:
-            sionna_structure["scene"].add(Transmitter(tx_antenna_name, position=tx_position, orientation=[0, 0, 0]))
-            sionna_structure["scene"].tx_array = sionna_structure["scene"].tx_array
-            if sionna_structure["verbose"]:
-                print(f"Added TX antenna for car_{car_id}: {tx_antenna_name}")
-
-        if sionna_structure["scene"].get(rx_antenna_name) is None:
-            sionna_structure["scene"].add(Receiver(rx_antenna_name, position=rx_position, orientation=[0, 0, 0]))
-            sionna_structure["scene"].rx_array = sionna_structure["scene"].rx_array
-            if sionna_structure["verbose"]:
-                print(f"Added RX antenna for car_{car_id}: {rx_antenna_name}")
+    ensure_antennas(sionna_structure)
 
     # Compute paths
     paths = sionna_structure["path_solver"](scene=sionna_structure["scene"],
@@ -281,7 +806,8 @@ def compute_rays(sionna_structure):
                                     if sionna_structure["verbose"]:
                                         print(f"Forced update for {car_name} and its RX antenna in the scene.")
                             else:
-                                print(f"ERROR: no {car_name} in the scene for forced update, use Blender to check")
+                                if sionna_structure["verbose"]:
+                                    print(f"No {car_name} mesh in the scene for forced update; antenna markers remain authoritative.")
 
                         # Re-do matching with updated locations
                         t = time.time()
@@ -329,6 +855,7 @@ def get_path_loss(car1_id, car2_id, sionna_structure):
 
     if sionna_structure["time_checker"]:
         print(f"Pathloss calculation took: {(time.time() - t) * 1000} ms")
+    export_radio_map_if_needed(sionna_structure)
     return path_loss
 
 def manage_path_loss_request(message, sionna_structure):
@@ -428,10 +955,28 @@ def manage_los_request(message, sionna_structure):
 # Function to kill processes using a specific port
 def kill_process_using_port(port, verbose=False):
     try:
-        result = subprocess.run(['lsof', '-i', f':{port}'], stdout=subprocess.PIPE)
+        result = subprocess.run(['lsof', '-nP', '-t', f'-i:{port}'], stdout=subprocess.PIPE)
+        pids = set()
         for line in result.stdout.decode('utf-8').split('\n'):
-            if 'LISTEN' in line:
-                pid = int(line.split()[1])
+            line = line.strip()
+            if not line:
+                continue
+            pid = int(line)
+            if pid != os.getpid():
+                pids.add(pid)
+
+        for pid in pids:
+            os.kill(pid, signal.SIGTERM)
+            if verbose:
+                print(f"Requested process {pid} using port {port} to terminate")
+
+        if pids:
+            time.sleep(0.5)
+            for pid in pids:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
                 os.kill(pid, signal.SIGKILL)
                 if verbose:
                     print(f"Killed process {pid} using port {port}")
@@ -486,6 +1031,37 @@ def main():
     parser.add_argument('--time-checker', action='store_true', help='[DEBUG] Flag to check time taken for each operation')
     parser.add_argument('--gpu', type=int, help='Number of GPUs, set 0 to use CPU only (refer to TensorFlow and Sionna documentation)', default=2)
     parser.add_argument('--dynamic-objects-name', type=str, help='Name of the dynamic objects; in the Scenario they must be called e.g., car_id, with id=SUMO ID (only number)', default="car")
+    parser.add_argument('--export-radio-map', action='store_true', help='Export a Sionna RT radio-map PNG/NPY whenever the configured TX/RX position pair changes')
+    parser.add_argument('--radio-map-dir', type=str, default='radio_map_outputs', help='Directory for exported radio-map files')
+    parser.add_argument('--radio-map-tx-car-id', type=int, default=2, help='Sionna car id used as radio-map transmitter, default 2 for the LTE eNB')
+    parser.add_argument('--radio-map-rx-car-id', type=int, default=1, help='Sionna car id used as radio-map receiver marker, default 1 for the LTE UE')
+    parser.add_argument('--radio-map-cell-size', type=float, nargs=2, default=[5.0, 5.0], metavar=('DX', 'DY'), help='Radio-map cell size in meters')
+    parser.add_argument('--radio-map-size', type=float, nargs=2, default=None, metavar=('X', 'Y'), help='Optional radio-map size in meters; omit to cover the scene')
+    parser.add_argument('--radio-map-center', type=float, nargs=3, default=None, metavar=('X', 'Y', 'Z'), help='Optional radio-map center; omit to use Sionna scene default')
+    parser.add_argument('--radio-map-samples', type=int, default=50000, help='Samples per transmitter for radio-map solver')
+    parser.add_argument('--radio-map-summary-csv', type=str, default=None, help='CSV file collecting one row for every exported radio map')
+    parser.add_argument('--disable-radio-map-scene-render', action='store_false', dest='radio_map_render_scene', help='Disable native Sionna scene render; still writes grid PNG/NPY/JSON/CSV')
+    parser.add_argument('--radio-map-camera-mode', type=str, choices=['rx-orbit', 'fixed'], default='rx-orbit', help='Use a camera anchored near each RX/UE position, or a fixed camera')
+    parser.add_argument('--radio-map-camera-position', type=float, nargs=3, default=[220.0, -360.0, 220.0], metavar=('X', 'Y', 'Z'), help='Camera position for native Sionna radio-map renders')
+    parser.add_argument('--radio-map-camera-look-at', type=float, nargs=3, default=[0.0, 0.0, 0.0], metavar=('X', 'Y', 'Z'), help='Camera look-at point for native Sionna radio-map renders')
+    parser.add_argument('--radio-map-camera-rx-offset', type=float, nargs=3, default=[-120.0, -180.0, 140.0], metavar=('DX', 'DY', 'DZ'), help='Fallback camera offset from the current RX/UE position when TX and RX overlap')
+    parser.add_argument('--radio-map-camera-rx-distance', type=float, default=130.0, help='Minimum camera distance behind the RX/UE, away from TX, when camera mode is rx-orbit')
+    parser.add_argument('--radio-map-camera-distance-scale', type=float, default=1.05, help='Additional rx-orbit camera distance as a fraction of TX/RX horizontal distance')
+    parser.add_argument('--radio-map-camera-side-offset', type=float, default=-60.0, help='Side offset in meters for rx-orbit camera framing')
+    parser.add_argument('--radio-map-camera-height', type=float, default=140.0, help='Camera height above the RX/UE when camera mode is rx-orbit')
+    parser.add_argument('--radio-map-camera-height-scale', type=float, default=0.55, help='Minimum rx-orbit camera height as a fraction of TX/RX horizontal distance')
+    parser.add_argument('--radio-map-camera-rx-target-weight', type=float, default=0.7, help='Camera look-at weight toward RX in rx-orbit mode; 0.5 is midpoint, 1.0 is RX')
+    parser.add_argument('--radio-map-camera-look-at-height', type=float, default=20.0, help='Look-at z coordinate when camera mode is rx-orbit')
+    parser.add_argument('--radio-map-camera-fov', type=float, default=78.0, help='Camera field of view in degrees for native Sionna renders')
+    parser.add_argument('--radio-map-show-orientations', action='store_true', default=True, help='Show Sionna device orientation arrows in native radio-map renders')
+    parser.add_argument('--disable-radio-map-show-orientations', action='store_false', dest='radio_map_show_orientations', help='Hide Sionna device orientation arrows in native radio-map renders')
+    parser.add_argument('--disable-radio-map-stats-plot', action='store_false', dest='radio_map_export_stats_plot', help='Disable per-coordinate radio-map statistics plots')
+    parser.add_argument('--radio-map-resolution', type=int, nargs=2, default=[756, 570], metavar=('WIDTH', 'HEIGHT'), help='Native Sionna render resolution in pixels')
+    parser.add_argument('--radio-map-render-samples', type=int, default=128, help='Native Sionna render samples per pixel')
+    parser.add_argument('--radio-map-vmin', type=float, default=-140.0, help='Minimum dB value for native radio-map color scale')
+    parser.add_argument('--radio-map-vmax', type=float, default=-40.0, help='Maximum dB value for native radio-map color scale')
+    parser.add_argument('--radio-map-tx-power-dbm', type=float, default=23.0, help='TX power used for derived RX power/SNR metrics in radio-map CSV and stats plots')
+    parser.add_argument('--radio-map-noise-figure-db', type=float, default=7.0, help='Receiver noise figure used for derived noise-floor/SNR metrics')
 
     args = parser.parse_args()
     # Scenario
@@ -512,6 +1088,36 @@ def main():
     time_checker = args.time_checker
     gpus = args.gpu
     dynamic_objects_name = args.dynamic_objects_name
+    export_radio_map = args.export_radio_map
+    radio_map_dir = args.radio_map_dir
+    radio_map_tx_car_id = args.radio_map_tx_car_id
+    radio_map_rx_car_id = args.radio_map_rx_car_id
+    radio_map_cell_size = args.radio_map_cell_size
+    radio_map_size = args.radio_map_size
+    radio_map_center = args.radio_map_center
+    radio_map_samples = args.radio_map_samples
+    radio_map_summary_csv = args.radio_map_summary_csv
+    radio_map_render_scene = args.radio_map_render_scene
+    radio_map_camera_mode = args.radio_map_camera_mode
+    radio_map_camera_position = args.radio_map_camera_position
+    radio_map_camera_look_at = args.radio_map_camera_look_at
+    radio_map_camera_rx_offset = args.radio_map_camera_rx_offset
+    radio_map_camera_rx_distance = args.radio_map_camera_rx_distance
+    radio_map_camera_distance_scale = args.radio_map_camera_distance_scale
+    radio_map_camera_side_offset = args.radio_map_camera_side_offset
+    radio_map_camera_height = args.radio_map_camera_height
+    radio_map_camera_height_scale = args.radio_map_camera_height_scale
+    radio_map_camera_rx_target_weight = args.radio_map_camera_rx_target_weight
+    radio_map_camera_look_at_height = args.radio_map_camera_look_at_height
+    radio_map_camera_fov = args.radio_map_camera_fov
+    radio_map_show_orientations = args.radio_map_show_orientations
+    radio_map_export_stats_plot = args.radio_map_export_stats_plot
+    radio_map_resolution = args.radio_map_resolution
+    radio_map_render_samples = args.radio_map_render_samples
+    radio_map_vmin = args.radio_map_vmin
+    radio_map_vmax = args.radio_map_vmax
+    radio_map_tx_power_dbm = args.radio_map_tx_power_dbm
+    radio_map_noise_figure_db = args.radio_map_noise_figure_db
 
     kill_process_using_port(port, verbose)
     configure_gpu(verbose, gpus)
@@ -546,6 +1152,39 @@ def main():
     sionna_structure["diffuse_reflection"] = diffuse_reflection
     sionna_structure["refraction"] = refraction
     sionna_structure["seed"] = seed
+    sionna_structure["export_radio_map"] = export_radio_map
+    sionna_structure["radio_map_solver"] = RadioMapSolver()
+    sionna_structure["radio_map_dir"] = radio_map_dir
+    sionna_structure["radio_map_tx_car_id"] = radio_map_tx_car_id
+    sionna_structure["radio_map_rx_car_id"] = radio_map_rx_car_id
+    sionna_structure["radio_map_cell_size"] = radio_map_cell_size
+    sionna_structure["radio_map_size"] = radio_map_size
+    sionna_structure["radio_map_center"] = radio_map_center
+    sionna_structure["radio_map_samples"] = radio_map_samples
+    sionna_structure["radio_map_summary_csv"] = radio_map_summary_csv
+    sionna_structure["radio_map_render_scene"] = radio_map_render_scene
+    sionna_structure["radio_map_camera_mode"] = radio_map_camera_mode
+    sionna_structure["radio_map_camera_position"] = radio_map_camera_position
+    sionna_structure["radio_map_camera_look_at"] = radio_map_camera_look_at
+    sionna_structure["radio_map_camera_rx_offset"] = radio_map_camera_rx_offset
+    sionna_structure["radio_map_camera_rx_distance"] = radio_map_camera_rx_distance
+    sionna_structure["radio_map_camera_distance_scale"] = radio_map_camera_distance_scale
+    sionna_structure["radio_map_camera_side_offset"] = radio_map_camera_side_offset
+    sionna_structure["radio_map_camera_height"] = radio_map_camera_height
+    sionna_structure["radio_map_camera_height_scale"] = radio_map_camera_height_scale
+    sionna_structure["radio_map_camera_rx_target_weight"] = radio_map_camera_rx_target_weight
+    sionna_structure["radio_map_camera_look_at_height"] = radio_map_camera_look_at_height
+    sionna_structure["radio_map_camera_fov"] = radio_map_camera_fov
+    sionna_structure["radio_map_show_orientations"] = radio_map_show_orientations
+    sionna_structure["radio_map_export_stats_plot"] = radio_map_export_stats_plot
+    sionna_structure["radio_map_resolution"] = radio_map_resolution
+    sionna_structure["radio_map_render_samples"] = radio_map_render_samples
+    sionna_structure["radio_map_vmin"] = radio_map_vmin
+    sionna_structure["radio_map_vmax"] = radio_map_vmax
+    sionna_structure["radio_map_tx_power_dbm"] = radio_map_tx_power_dbm
+    sionna_structure["radio_map_noise_figure_db"] = radio_map_noise_figure_db
+    sionna_structure["radio_map_summary_csv_initialized"] = False
+    sionna_structure["exported_radio_map_signatures"] = set()
 
     # Caches - do not edit
     sionna_structure["path_loss_cache"] = {}
@@ -554,14 +1193,23 @@ def main():
 
     # Set up UDP socket
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    if local_machine:
-        udp_socket.bind(("127.0.0.1", port))  # Local machine configuration
-        if verbose:
-            print(f"Expecting UDP messages from ns3-rt on localhost:{port}")
-    else:
-        udp_socket.bind(("0.0.0.0", port))  # External server configuration
-        if verbose:
-            print(f"Expecting UDP messages from ns3-rt on UDP/{port}")
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp_socket.settimeout(1.0)
+    try:
+        if local_machine:
+            udp_socket.bind(("127.0.0.1", port))  # Local machine configuration
+            if verbose:
+                print(f"Expecting UDP messages from ns3-rt on localhost:{port}")
+        else:
+            udp_socket.bind(("0.0.0.0", port))  # External server configuration
+            if verbose:
+                print(f"Expecting UDP messages from ns3-rt on UDP/{port}")
+    except OSError as e:
+        udp_socket.close()
+        raise SystemExit(
+            f"Unable to bind Sionna UDP port {port}: {e}. "
+            f"Stop the old server with: lsof -nP -t -i:{port} | xargs -r kill"
+        )
 
     # Location databases and caches
     sionna_structure["SUMO_live_location_db"] = {}  # Real-time object locations in SUMO
@@ -571,42 +1219,50 @@ def main():
 
     print(f"Setup complete. Working at {frequency / 1e9} GHz, bandwidth {bandwidth / 1e6} MHz.")
 
-    while True:
-        # Receive data from the socket
-        payload, address = udp_socket.recvfrom(1024)
-        message = payload.decode()
+    try:
+        while True:
+            # Receive data from the socket. The timeout keeps Ctrl+C responsive
+            # while the server is waiting between ns-3 requests.
+            try:
+                payload, address = udp_socket.recvfrom(1024)
+            except socket.timeout:
+                continue
+            message = payload.decode()
 
-        if verbose:
-            print(f"Got new message: {message}")
+            if verbose:
+                print(f"Got new message: {message}")
 
-        if message.startswith("LOC_UPDATE:"):
-            updated_car = manage_location_message(message, sionna_structure)
-            if updated_car is not None:
-                response = "LOC_CONFIRM:" + "obj" + str(updated_car)
-                udp_socket.sendto(response.encode(), address)
+            if message.startswith("LOC_UPDATE:"):
+                updated_car = manage_location_message(message, sionna_structure)
+                if updated_car is not None:
+                    response = "LOC_CONFIRM:" + "obj" + str(updated_car)
+                    udp_socket.sendto(response.encode(), address)
 
-        if message.startswith("CALC_REQUEST_PATHGAIN:"):
-            pathloss = manage_path_loss_request(message, sionna_structure)
-            if pathloss is not None:
-                response = "CALC_DONE_PATHGAIN:" + str(pathloss)
-                udp_socket.sendto(response.encode(), address)
+            if message.startswith("CALC_REQUEST_PATHGAIN:"):
+                pathloss = manage_path_loss_request(message, sionna_structure)
+                if pathloss is not None:
+                    response = "CALC_DONE_PATHGAIN:" + str(pathloss)
+                    udp_socket.sendto(response.encode(), address)
 
-        if message.startswith("CALC_REQUEST_DELAY:"):
-            delay = manage_delay_request(message, sionna_structure)
-            if delay is not None:
-                response = "CALC_DONE_DELAY:" + str(delay)
-                udp_socket.sendto(response.encode(), address)
+            if message.startswith("CALC_REQUEST_DELAY:"):
+                delay = manage_delay_request(message, sionna_structure)
+                if delay is not None:
+                    response = "CALC_DONE_DELAY:" + str(delay)
+                    udp_socket.sendto(response.encode(), address)
 
-        if message.startswith("CALC_REQUEST_LOS:"):
-            los = manage_los_request(message, sionna_structure)
-            if los is not None:
-                response = "CALC_DONE_LOS:" + str(los)
-                udp_socket.sendto(response.encode(), address)
+            if message.startswith("CALC_REQUEST_LOS:"):
+                los = manage_los_request(message, sionna_structure)
+                if los is not None:
+                    response = "CALC_DONE_LOS:" + str(los)
+                    udp_socket.sendto(response.encode(), address)
 
-        if message.startswith("SHUTDOWN_SIONNA"):
-            print("Got SHUTDOWN_SIONNA message. Bye!")
-            udp_socket.close()
-            break
+            if message.startswith("SHUTDOWN_SIONNA"):
+                print("Got SHUTDOWN_SIONNA message. Bye!")
+                break
+    except KeyboardInterrupt:
+        print("Interrupted by user. Shutting down Sionna server.")
+    finally:
+        udp_socket.close()
 
 
 # Entry point

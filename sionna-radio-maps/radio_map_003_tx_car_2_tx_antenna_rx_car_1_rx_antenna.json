@@ -1,0 +1,76 @@
+{
+  "tx": {
+    "name": "car_2_tx_antenna",
+    "position": {
+      "x": 49.0,
+      "y": -17.0,
+      "z": 12.0,
+      "angle": 0.0,
+      "v_x": 0.0,
+      "v_y": 0.0,
+      "v_z": 0.0
+    }
+  },
+  "rx": {
+    "name": "car_1_rx_antenna",
+    "position": {
+      "x": -208.0,
+      "y": -101.0,
+      "z": 1.5,
+      "angle": 0.0,
+      "v_x": 0.0,
+      "v_y": 0.0,
+      "v_z": 0.0
+    }
+  },
+  "tx_rx_distance_m": 270.5831665126269,
+  "tx_rx_distance_2d_m": 270.37936311782374,
+  "frequency_hz": 2100000000.0,
+  "bandwidth_hz": 10000000.0,
+  "tx_power_dbm": 23.0,
+  "noise_figure_db": 7.0,
+  "cell_size": [
+    5.0,
+    5.0
+  ],
+  "size": null,
+  "center": null,
+  "samples_per_tx": 50000,
+  "path_gain_db_npy": "../../sionna-radio-maps/radio_map_003_tx_car_2_tx_antenna_rx_car_1_rx_antenna_path_gain_db.npy",
+  "scene_png": "../../sionna-radio-maps/radio_map_003_tx_car_2_tx_antenna_rx_car_1_rx_antenna_scene.png",
+  "grid_png": "../../sionna-radio-maps/radio_map_003_tx_car_2_tx_antenna_rx_car_1_rx_antenna_grid.png",
+  "stats_png": "../../sionna-radio-maps/radio_map_003_tx_car_2_tx_antenna_rx_car_1_rx_antenna_stats.png",
+  "camera_mode": "rx-orbit",
+  "camera_position": [
+    -419.39047589239897,
+    -106.96902018635052,
+    153.35864971480308
+  ],
+  "camera_look_at": [
+    -130.89999999999998,
+    -75.79999999999998,
+    20.0
+  ],
+  "metrics": {
+    "tx_rx_distance_3d_m": 270.5831665126269,
+    "tx_rx_distance_2d_m": 270.37936311782374,
+    "rx_path_gain_db": -300.0,
+    "rx_path_loss_db": 300.0,
+    "tx_power_dbm": 23.0,
+    "rx_power_dbm": -277.0,
+    "noise_figure_db": 7.0,
+    "noise_floor_dbm": -97.0,
+    "snr_db": -180.0,
+    "path_gain_min_db": -300.0,
+    "path_gain_mean_db": -264.1675109863281,
+    "path_gain_max_db": -58.6298713684082,
+    "path_loss_min_db": 58.6298713684082,
+    "path_loss_mean_db": 264.1675109863281,
+    "path_loss_max_db": 300.0,
+    "geometric_one_way_delay_s": 9.025682911363531e-07,
+    "geometric_rtt_s": 1.8051365822727063e-06,
+    "ray_one_way_delay_s": 1.1732680604836787e-06,
+    "ray_rtt_s": 2.3465361209673574e-06,
+    "los_status": true
+  }
+}
