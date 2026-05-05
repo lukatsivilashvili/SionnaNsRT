@@ -1,0 +1,5 @@
+<routes>
+  <vType id="cnam_car" accel="2.6" decel="4.5" sigma="0.5" length="4.5" maxSpeed="13.9"/>
+  <route id="cnam_route" edges="e0 e1 e2 e3"/>
+  <vehicle id="car_1" type="cnam_car" route="cnam_route" depart="0" departSpeed="max"/>
+</routes>

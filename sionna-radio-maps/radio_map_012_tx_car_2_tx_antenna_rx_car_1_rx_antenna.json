@@ -1,0 +1,106 @@
+{
+  "tx": {
+    "name": "car_2_tx_antenna",
+    "position": {
+      "x": 49.0,
+      "y": -17.0,
+      "z": 12.0,
+      "angle": 0.0,
+      "v_x": 0.0,
+      "v_y": 0.0,
+      "v_z": 0.0
+    }
+  },
+  "rx": {
+    "name": "car_1_rx_antenna",
+    "position": {
+      "x": -80.528301,
+      "y": -5.164288,
+      "z": 1.5,
+      "angle": 0.0,
+      "v_x": 0.0,
+      "v_y": 0.0,
+      "v_z": 0.0
+    }
+  },
+  "tx_rx_distance_m": 130.49105271432808,
+  "tx_rx_distance_2d_m": 130.06792394166038,
+  "frequency_hz": 2100000000.0,
+  "bandwidth_hz": 10000000.0,
+  "tx_power_dbm": 23.0,
+  "noise_figure_db": 7.0,
+  "cell_size": [
+    5.0,
+    5.0
+  ],
+  "size": null,
+  "center": null,
+  "samples_per_tx": 50000,
+  "path_gain_db_npy": "/home/luksona/WorkingFiles/sionna_files/SionnaNsRT/sionna-radio-maps/radio_map_012_tx_car_2_tx_antenna_rx_car_1_rx_antenna_path_gain_db.npy",
+  "scene_png": "/home/luksona/WorkingFiles/sionna_files/SionnaNsRT/sionna-radio-maps/radio_map_012_tx_car_2_tx_antenna_rx_car_1_rx_antenna_scene.png",
+  "grid_png": "/home/luksona/WorkingFiles/sionna_files/SionnaNsRT/sionna-radio-maps/radio_map_012_tx_car_2_tx_antenna_rx_car_1_rx_antenna_grid.png",
+  "stats_png": "/home/luksona/WorkingFiles/sionna_files/SionnaNsRT/sionna-radio-maps/radio_map_012_tx_car_2_tx_antenna_rx_car_1_rx_antenna_stats.png",
+  "camera_mode": "birdseye",
+  "camera_position": [
+    -62.108288359138115,
+    -24.981573246254364,
+    260.0
+  ],
+  "camera_look_at": [
+    -29.708288359138116,
+    18.218426753745632,
+    20.0
+  ],
+  "visualization": {
+    "scene_png": "/home/luksona/WorkingFiles/sionna_files/SionnaNsRT/sionna-radio-maps/radio_map_012_tx_car_2_tx_antenna_rx_car_1_rx_antenna_scene.png",
+    "grid_png": "/home/luksona/WorkingFiles/sionna_files/SionnaNsRT/sionna-radio-maps/radio_map_012_tx_car_2_tx_antenna_rx_car_1_rx_antenna_grid.png",
+    "scene_resolution": [
+      1920,
+      1080
+    ],
+    "grid_resolution": [
+      2240,
+      1600
+    ],
+    "camera_mode": "birdseye",
+    "birdseye_camera_used": true,
+    "route_overlay_csv": "/home/luksona/WorkingFiles/sionna_files/SionnaNsRT/results/sionna_ns3_experiment_20260505_233528/sumo_coordinates.csv",
+    "route_overlay_vehicle_id": "car_1",
+    "route_overlay_points": 20,
+    "route_overlay_applied": true,
+    "tx_marker_drawn": true,
+    "current_rx_marker_drawn": true,
+    "grid_route_overlay_applied": true,
+    "grid_tx_marker_drawn": true,
+    "grid_current_rx_marker_drawn": true,
+    "warnings": []
+  },
+  "route_overlay": {
+    "csv": "/home/luksona/WorkingFiles/sionna_files/SionnaNsRT/results/sionna_ns3_experiment_20260505_233528/sumo_coordinates.csv",
+    "vehicle_id": "car_1",
+    "radius": 2.5,
+    "stride": 1
+  },
+  "metrics": {
+    "tx_rx_distance_3d_m": 130.49105271432808,
+    "tx_rx_distance_2d_m": 130.06792394166038,
+    "rx_path_gain_db": -300.0,
+    "rx_path_loss_db": 300.0,
+    "tx_power_dbm": 23.0,
+    "rx_power_dbm": -277.0,
+    "noise_figure_db": 7.0,
+    "noise_floor_dbm": -97.0,
+    "snr_db": -180.0,
+    "path_gain_min_db": -300.0,
+    "path_gain_mean_db": -264.1675109863281,
+    "path_gain_max_db": -58.6298713684082,
+    "path_loss_min_db": 58.6298713684082,
+    "path_loss_mean_db": 264.1675109863281,
+    "path_loss_max_db": 300.0,
+    "geometric_one_way_delay_s": 4.352712993010921e-07,
+    "geometric_rtt_s": 8.705425986021842e-07,
+    "ray_one_way_delay_s": 4.3527126081244205e-07,
+    "ray_rtt_s": 8.705425216248841e-07,
+    "los_status": true
+  }
+}

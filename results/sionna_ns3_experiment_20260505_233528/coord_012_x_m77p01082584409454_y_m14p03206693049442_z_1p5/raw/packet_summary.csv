@@ -1,0 +1,2 @@
+index,window_start_s,window_end_s,enb_x,enb_y,enb_z,ue_x,ue_y,ue_z,tx_rx_distance_3d_m,app_tx_packets,app_tx_bytes,tap_side_rx_packets,tap_side_rx_bytes,delivery_ratio,first_app_tx_s,last_app_tx_s,first_tap_side_rx_s,last_tap_side_rx_s,mean_tap_side_rx_interarrival_s
+0,0.000000000,20.000000000,49.000000000,-17.000000000,12.000000000,-77.010825844,-14.032066930,1.500000000,126.482357887,0,0,0,0,0.000000000,-1.000000000,-1.000000000,-1.000000000,-1.000000000,nan

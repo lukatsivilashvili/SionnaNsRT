@@ -108,6 +108,23 @@ def radio_map_camera_for_positions(sionna_structure, tx_pos, rx_pos):
     tx_array = position_to_array(tx_pos)
     rx_array = position_to_array(rx_pos)
 
+    if sionna_structure["radio_map_camera_mode"] == "birdseye":
+        points = [tx_array, rx_array]
+        for point in read_route_overlay_points(sionna_structure):
+            points.append(np.array(point, dtype=float))
+        stacked = np.vstack(points)
+        min_xy = np.nanmin(stacked[:, :2], axis=0)
+        max_xy = np.nanmax(stacked[:, :2], axis=0)
+        center_xy = (min_xy + max_xy) / 2.0
+        span = max(float(np.max(max_xy - min_xy)), 180.0)
+        look_at = np.array([center_xy[0], center_xy[1], sionna_structure["radio_map_camera_look_at_height"]])
+        camera_position = np.array([
+            center_xy[0] - 0.18 * span,
+            center_xy[1] - 0.24 * span,
+            max(260.0, 1.35 * span),
+        ])
+        return camera_position.tolist(), look_at.tolist()
+
     link_xy = rx_array[:2] - tx_array[:2]
     link_distance = np.linalg.norm(link_xy)
     if link_distance > 1e-6:
@@ -245,6 +262,101 @@ def create_radio_map_stats_plot(
     plt.close(fig)
 
 
+def read_route_overlay_points(sionna_structure):
+    csv_path = sionna_structure.get("route_overlay_csv")
+    if not csv_path:
+        return []
+    if not os.path.exists(csv_path):
+        if sionna_structure["verbose"]:
+            print(f"Route overlay CSV not found: {csv_path}")
+        return []
+
+    vehicle_id = sionna_structure.get("route_overlay_vehicle_id")
+    stride = max(1, int(sionna_structure.get("route_overlay_stride", 1)))
+    points = []
+    sample_index = 0
+    with open(csv_path, encoding="utf-8", newline="") as route_file:
+        reader = csv.DictReader(route_file)
+        for row in reader:
+            if vehicle_id and row.get("vehicle_id") != vehicle_id:
+                continue
+            if sample_index % stride != 0:
+                sample_index += 1
+                continue
+            try:
+                points.append((float(row["x"]), float(row["y"]), float(row.get("z") or 1.5)))
+            except (KeyError, TypeError, ValueError):
+                continue
+            finally:
+                sample_index += 1
+    return points
+
+
+def add_visual_overlay_markers(sionna_structure, tx_pos, rx_pos):
+    scene = sionna_structure["scene"]
+    points = read_route_overlay_points(sionna_structure)
+
+    marker_names = []
+    warnings = []
+    radius = float(sionna_structure.get("route_overlay_radius", 2.5))
+    for index, point in enumerate(points):
+        name = f"visual_route_overlay_{index:04d}"
+        if scene.get(name) is not None:
+            scene.remove(name)
+        try:
+            scene.add(
+                Receiver(
+                    name,
+                    position=[point[0], point[1], point[2] + 0.4],
+                    orientation=[0, 0, 0],
+                    color=(1.0, 0.9, 0.0),
+                    display_radius=radius,
+                )
+            )
+            marker_names.append(name)
+        except Exception as exc:
+            warnings.append(f"Could not add route marker {name}: {exc}")
+
+    for name, position, color, marker_radius in [
+        ("visual_tx_marker", tx_pos, (1.0, 0.0, 0.0), max(radius * 1.9, 5.0)),
+        ("visual_current_rx_marker", rx_pos, (0.0, 0.65, 1.0), max(radius * 1.5, 4.0)),
+    ]:
+        if scene.get(name) is not None:
+            scene.remove(name)
+        try:
+            scene.add(
+                Receiver(
+                    name,
+                    position=[float(position["x"]), float(position["y"]), float(position["z"]) + 2.0],
+                    orientation=[0, 0, 0],
+                    color=color,
+                    display_radius=marker_radius,
+                )
+            )
+            marker_names.append(name)
+        except Exception as exc:
+            warnings.append(f"Could not add visual marker {name}: {exc}")
+
+    return marker_names, {
+        "route_overlay_points": len(points),
+        "route_overlay_applied": bool(points),
+        "tx_marker_drawn": "visual_tx_marker" in marker_names,
+        "current_rx_marker_drawn": "visual_current_rx_marker" in marker_names,
+        "warnings": warnings,
+    }
+
+
+def remove_route_overlay_markers(sionna_structure, marker_names):
+    scene = sionna_structure["scene"]
+    for name in marker_names:
+        try:
+            if scene.get(name) is not None:
+                scene.remove(name)
+        except Exception as exc:
+            if sionna_structure["verbose"]:
+                print(f"Could not remove route overlay marker {name}: {exc}")
+
+
 def write_radio_map_summary(row, sionna_structure):
     csv_path = sionna_structure["radio_map_summary_csv"]
     if csv_path is None:
@@ -380,12 +492,18 @@ def export_radio_map_if_needed(sionna_structure):
 
     tx_pos = sionna_structure["sionna_location_db"][tx_car_id]
     rx_pos = sionna_structure["sionna_location_db"][rx_car_id]
+    route_points = read_route_overlay_points(sionna_structure)
 
-    plt.figure(figsize=(10, 8))
+    plt.figure(figsize=(14, 10))
     image = plt.imshow(path_gain_db, origin="lower", extent=extent, cmap="viridis", aspect="equal")
     plt.colorbar(image, label="Path gain (dB)")
-    plt.scatter([tx_pos["x"]], [tx_pos["y"]], marker="^", c="red", s=90, label=f"TX {tx_name}")
-    plt.scatter([rx_pos["x"]], [rx_pos["y"]], marker="o", c="white", edgecolors="black", s=80, label=f"RX {rx_name}")
+    if route_points:
+        route_x = [point[0] for point in route_points]
+        route_y = [point[1] for point in route_points]
+        plt.plot(route_x, route_y, color="#ffea00", linewidth=2.8, alpha=0.95, label="SUMO RX path")
+        plt.scatter(route_x, route_y, marker=".", c="#ffea00", s=28, alpha=0.9)
+    plt.scatter([tx_pos["x"]], [tx_pos["y"]], marker="^", c="red", edgecolors="white", linewidths=1.2, s=180, label=f"TX {tx_name}")
+    plt.scatter([rx_pos["x"]], [rx_pos["y"]], marker="o", c="#00a6ff", edgecolors="white", linewidths=1.4, s=150, label=f"Current RX {rx_name}")
     plt.xlabel("x [m]")
     plt.ylabel("y [m]")
     plt.title(f"Sionna RT radio map: {tx_name} -> {rx_name}")
@@ -394,30 +512,40 @@ def export_radio_map_if_needed(sionna_structure):
     plt.savefig(grid_png_path, dpi=160)
     plt.close()
 
+    camera_position, camera_look_at = radio_map_camera_for_positions(sionna_structure, tx_pos, rx_pos)
+    visual_overlay_metadata = {
+        "route_overlay_points": len(route_points),
+        "route_overlay_applied": bool(route_points),
+        "tx_marker_drawn": False,
+        "current_rx_marker_drawn": False,
+        "warnings": [],
+    }
     if sionna_structure["radio_map_render_scene"]:
-        camera_position, camera_look_at = radio_map_camera_for_positions(sionna_structure, tx_pos, rx_pos)
         camera = Camera(
             position=camera_position,
             look_at=camera_look_at,
         )
-        scene.render_to_file(
-            camera=camera,
-            filename=scene_png_path,
-            radio_map=radio_map,
-            resolution=tuple(sionna_structure["radio_map_resolution"]),
-            num_samples=sionna_structure["radio_map_render_samples"],
-            rm_tx=tx_index,
-            rm_metric="path_gain",
-            rm_db_scale=True,
-            rm_vmin=sionna_structure["radio_map_vmin"],
-            rm_vmax=sionna_structure["radio_map_vmax"],
-            fov=sionna_structure["radio_map_camera_fov"],
-            show_devices=True,
-            show_orientations=sionna_structure["radio_map_show_orientations"],
-        )
+        route_marker_names, visual_overlay_metadata = add_visual_overlay_markers(sionna_structure, tx_pos, rx_pos)
+        try:
+            scene.render_to_file(
+                camera=camera,
+                filename=scene_png_path,
+                radio_map=radio_map,
+                resolution=tuple(sionna_structure["radio_map_resolution"]),
+                num_samples=sionna_structure["radio_map_render_samples"],
+                rm_tx=tx_index,
+                rm_metric="path_gain",
+                rm_db_scale=True,
+                rm_vmin=sionna_structure["radio_map_vmin"],
+                rm_vmax=sionna_structure["radio_map_vmax"],
+                fov=sionna_structure["radio_map_camera_fov"],
+                show_devices=True,
+                show_orientations=sionna_structure["radio_map_show_orientations"],
+            )
+        finally:
+            remove_route_overlay_markers(sionna_structure, route_marker_names)
     else:
         scene_png_path = ""
-        camera_position, camera_look_at = radio_map_camera_for_positions(sionna_structure, tx_pos, rx_pos)
 
     rx_xy = np.array([float(rx_pos["x"]), float(rx_pos["y"])])
     tx_xy = np.array([float(tx_pos["x"]), float(tx_pos["y"])])
@@ -498,6 +626,30 @@ def export_radio_map_if_needed(sionna_structure):
         "camera_mode": sionna_structure["radio_map_camera_mode"],
         "camera_position": camera_position,
         "camera_look_at": camera_look_at,
+        "visualization": {
+            "scene_png": scene_png_path,
+            "grid_png": grid_png_path,
+            "scene_resolution": list(sionna_structure["radio_map_resolution"]) if scene_png_path else "",
+            "grid_resolution": [2240, 1600],
+            "camera_mode": sionna_structure["radio_map_camera_mode"],
+            "birdseye_camera_used": sionna_structure["radio_map_camera_mode"] == "birdseye",
+            "route_overlay_csv": sionna_structure.get("route_overlay_csv"),
+            "route_overlay_vehicle_id": sionna_structure.get("route_overlay_vehicle_id"),
+            "route_overlay_points": visual_overlay_metadata["route_overlay_points"],
+            "route_overlay_applied": visual_overlay_metadata["route_overlay_applied"],
+            "tx_marker_drawn": visual_overlay_metadata["tx_marker_drawn"],
+            "current_rx_marker_drawn": visual_overlay_metadata["current_rx_marker_drawn"],
+            "grid_route_overlay_applied": bool(route_points),
+            "grid_tx_marker_drawn": True,
+            "grid_current_rx_marker_drawn": True,
+            "warnings": visual_overlay_metadata["warnings"],
+        },
+        "route_overlay": {
+            "csv": sionna_structure.get("route_overlay_csv"),
+            "vehicle_id": sionna_structure.get("route_overlay_vehicle_id"),
+            "radius": sionna_structure.get("route_overlay_radius"),
+            "stride": sionna_structure.get("route_overlay_stride"),
+        },
         "metrics": metrics,
     }
     with open(json_path, "w", encoding="utf-8") as metadata_file:
@@ -855,7 +1007,6 @@ def get_path_loss(car1_id, car2_id, sionna_structure):
 
     if sionna_structure["time_checker"]:
         print(f"Pathloss calculation took: {(time.time() - t) * 1000} ms")
-    export_radio_map_if_needed(sionna_structure)
     return path_loss
 
 def manage_path_loss_request(message, sionna_structure):
@@ -1032,6 +1183,7 @@ def main():
     parser.add_argument('--gpu', type=int, help='Number of GPUs, set 0 to use CPU only (refer to TensorFlow and Sionna documentation)', default=2)
     parser.add_argument('--dynamic-objects-name', type=str, help='Name of the dynamic objects; in the Scenario they must be called e.g., car_id, with id=SUMO ID (only number)', default="car")
     parser.add_argument('--export-radio-map', action='store_true', help='Export a Sionna RT radio-map PNG/NPY whenever the configured TX/RX position pair changes')
+    parser.add_argument('--radio-map-export-mode', choices=['auto', 'on-request'], default='auto', help='Export radio maps automatically after path-gain replies, or only when EXPORT_RADIO_MAP is requested')
     parser.add_argument('--radio-map-dir', type=str, default='radio_map_outputs', help='Directory for exported radio-map files')
     parser.add_argument('--radio-map-tx-car-id', type=int, default=2, help='Sionna car id used as radio-map transmitter, default 2 for the LTE eNB')
     parser.add_argument('--radio-map-rx-car-id', type=int, default=1, help='Sionna car id used as radio-map receiver marker, default 1 for the LTE UE')
@@ -1041,7 +1193,7 @@ def main():
     parser.add_argument('--radio-map-samples', type=int, default=50000, help='Samples per transmitter for radio-map solver')
     parser.add_argument('--radio-map-summary-csv', type=str, default=None, help='CSV file collecting one row for every exported radio map')
     parser.add_argument('--disable-radio-map-scene-render', action='store_false', dest='radio_map_render_scene', help='Disable native Sionna scene render; still writes grid PNG/NPY/JSON/CSV')
-    parser.add_argument('--radio-map-camera-mode', type=str, choices=['rx-orbit', 'fixed'], default='rx-orbit', help='Use a camera anchored near each RX/UE position, or a fixed camera')
+    parser.add_argument('--radio-map-camera-mode', type=str, choices=['birdseye', 'rx-orbit', 'fixed'], default='birdseye', help='Use a birdseye scene view, a camera anchored near each RX/UE position, or a fixed camera')
     parser.add_argument('--radio-map-camera-position', type=float, nargs=3, default=[220.0, -360.0, 220.0], metavar=('X', 'Y', 'Z'), help='Camera position for native Sionna radio-map renders')
     parser.add_argument('--radio-map-camera-look-at', type=float, nargs=3, default=[0.0, 0.0, 0.0], metavar=('X', 'Y', 'Z'), help='Camera look-at point for native Sionna radio-map renders')
     parser.add_argument('--radio-map-camera-rx-offset', type=float, nargs=3, default=[-120.0, -180.0, 140.0], metavar=('DX', 'DY', 'DZ'), help='Fallback camera offset from the current RX/UE position when TX and RX overlap')
@@ -1056,12 +1208,16 @@ def main():
     parser.add_argument('--radio-map-show-orientations', action='store_true', default=True, help='Show Sionna device orientation arrows in native radio-map renders')
     parser.add_argument('--disable-radio-map-show-orientations', action='store_false', dest='radio_map_show_orientations', help='Hide Sionna device orientation arrows in native radio-map renders')
     parser.add_argument('--disable-radio-map-stats-plot', action='store_false', dest='radio_map_export_stats_plot', help='Disable per-coordinate radio-map statistics plots')
-    parser.add_argument('--radio-map-resolution', type=int, nargs=2, default=[756, 570], metavar=('WIDTH', 'HEIGHT'), help='Native Sionna render resolution in pixels')
+    parser.add_argument('--radio-map-resolution', type=int, nargs=2, default=[1920, 1080], metavar=('WIDTH', 'HEIGHT'), help='Native Sionna render resolution in pixels')
     parser.add_argument('--radio-map-render-samples', type=int, default=128, help='Native Sionna render samples per pixel')
     parser.add_argument('--radio-map-vmin', type=float, default=-140.0, help='Minimum dB value for native radio-map color scale')
     parser.add_argument('--radio-map-vmax', type=float, default=-40.0, help='Maximum dB value for native radio-map color scale')
     parser.add_argument('--radio-map-tx-power-dbm', type=float, default=23.0, help='TX power used for derived RX power/SNR metrics in radio-map CSV and stats plots')
     parser.add_argument('--radio-map-noise-figure-db', type=float, default=7.0, help='Receiver noise figure used for derived noise-floor/SNR metrics')
+    parser.add_argument('--route-overlay-csv', type=str, default=None, help='Optional SUMO coordinate CSV to draw as route markers on native scene renders')
+    parser.add_argument('--route-overlay-vehicle-id', type=str, default='car_1', help='Vehicle id to draw from the route overlay CSV')
+    parser.add_argument('--route-overlay-radius', type=float, default=2.5, help='Display radius for route overlay markers in native scene renders')
+    parser.add_argument('--route-overlay-stride', type=int, default=1, help='Draw every Nth route overlay sample')
 
     args = parser.parse_args()
     # Scenario
@@ -1089,6 +1245,7 @@ def main():
     gpus = args.gpu
     dynamic_objects_name = args.dynamic_objects_name
     export_radio_map = args.export_radio_map
+    radio_map_export_mode = args.radio_map_export_mode
     radio_map_dir = args.radio_map_dir
     radio_map_tx_car_id = args.radio_map_tx_car_id
     radio_map_rx_car_id = args.radio_map_rx_car_id
@@ -1118,6 +1275,10 @@ def main():
     radio_map_vmax = args.radio_map_vmax
     radio_map_tx_power_dbm = args.radio_map_tx_power_dbm
     radio_map_noise_figure_db = args.radio_map_noise_figure_db
+    route_overlay_csv = args.route_overlay_csv
+    route_overlay_vehicle_id = args.route_overlay_vehicle_id
+    route_overlay_radius = args.route_overlay_radius
+    route_overlay_stride = args.route_overlay_stride
 
     kill_process_using_port(port, verbose)
     configure_gpu(verbose, gpus)
@@ -1153,6 +1314,7 @@ def main():
     sionna_structure["refraction"] = refraction
     sionna_structure["seed"] = seed
     sionna_structure["export_radio_map"] = export_radio_map
+    sionna_structure["radio_map_export_mode"] = radio_map_export_mode
     sionna_structure["radio_map_solver"] = RadioMapSolver()
     sionna_structure["radio_map_dir"] = radio_map_dir
     sionna_structure["radio_map_tx_car_id"] = radio_map_tx_car_id
@@ -1183,6 +1345,10 @@ def main():
     sionna_structure["radio_map_vmax"] = radio_map_vmax
     sionna_structure["radio_map_tx_power_dbm"] = radio_map_tx_power_dbm
     sionna_structure["radio_map_noise_figure_db"] = radio_map_noise_figure_db
+    sionna_structure["route_overlay_csv"] = route_overlay_csv
+    sionna_structure["route_overlay_vehicle_id"] = route_overlay_vehicle_id
+    sionna_structure["route_overlay_radius"] = route_overlay_radius
+    sionna_structure["route_overlay_stride"] = route_overlay_stride
     sionna_structure["radio_map_summary_csv_initialized"] = False
     sionna_structure["exported_radio_map_signatures"] = set()
 
@@ -1243,6 +1409,12 @@ def main():
                 if pathloss is not None:
                     response = "CALC_DONE_PATHGAIN:" + str(pathloss)
                     udp_socket.sendto(response.encode(), address)
+                    if sionna_structure["radio_map_export_mode"] == "auto":
+                        export_radio_map_if_needed(sionna_structure)
+
+            if message.startswith("EXPORT_RADIO_MAP"):
+                export_radio_map_if_needed(sionna_structure)
+                udp_socket.sendto(b"EXPORT_RADIO_MAP_DONE", address)
 
             if message.startswith("CALC_REQUEST_DELAY:"):
                 delay = manage_delay_request(message, sionna_structure)

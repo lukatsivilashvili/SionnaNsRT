@@ -1,0 +1,9 @@
+<configuration>
+  <input>
+    <net-file value="cnam.net.xml"/>
+    <route-files value="cnam.rou.xml"/>
+  </input>
+  <time>
+    <begin value="0"/>
+  </time>
+</configuration>

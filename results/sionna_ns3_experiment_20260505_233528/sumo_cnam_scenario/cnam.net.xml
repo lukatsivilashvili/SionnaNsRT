@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2026-05-05 23:35:28 by Eclipse SUMO netconvert Version 1.18.0
+<configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/netconvertConfiguration.xsd">
+
+    <input>
+        <node-files value="results/sionna_ns3_experiment_20260505_233528/sumo_cnam_scenario/cnam.nod.xml"/>
+        <edge-files value="results/sionna_ns3_experiment_20260505_233528/sumo_cnam_scenario/cnam.edg.xml"/>
+    </input>
+
+    <output>
+        <output-file value="results/sionna_ns3_experiment_20260505_233528/sumo_cnam_scenario/cnam.net.xml"/>
+    </output>
+
+    <processing>
+        <offset.disable-normalization value="true"/>
+    </processing>
+
+</configuration>
+-->
+
+<net version="1.16" junctionCornerDetail="5" limitTurnSpeed="5.50" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/net_file.xsd">
+
+    <location netOffset="0.00,0.00" convBoundary="-208.00,-101.00,205.00,177.00" origBoundary="-208.00,-101.00,205.00,177.00" projParameter="!"/>
+
+    <edge id=":n1_0" function="internal">
+        <lane id=":n1_0_0" index="0" speed="3.92" length="2.28" shape="-69.69,-28.88 -70.30,-28.92 -70.80,-28.77 -71.21,-28.43 -71.51,-27.90"/>
+    </edge>
+    <edge id=":n2_0" function="internal">
+        <lane id=":n2_0_0" index="0" speed="4.10" length="4.67" shape="-118.51,90.59 -119.21,91.90 -119.94,92.35 -120.68,91.94 -121.45,90.67"/>
+    </edge>
+    <edge id=":n3_0" function="internal">
+        <lane id=":n3_0_0" index="0" speed="4.43" length="6.46" shape="-209.45,-100.33 -210.20,-102.40 -210.06,-103.42 -209.03,-103.40 -207.11,-102.33"/>
+    </edge>
+
+    <edge id="e0" from="n0" to="n1" priority="1">
+        <lane id="e0_0" index="0" speed="13.90" length="103.60" shape="31.67,-7.43 -69.69,-28.88"/>
+    </edge>
+    <edge id="e1" from="n1" to="n2" priority="1">
+        <lane id="e1_0" index="0" speed="13.90" length="127.47" shape="-71.51,-27.90 -118.51,90.59"/>
+    </edge>
+    <edge id="e2" from="n2" to="n3" priority="1">
+        <lane id="e2_0" index="0" speed="13.90" length="210.30" shape="-121.45,90.67 -209.45,-100.33"/>
+    </edge>
+    <edge id="e3" from="n3" to="n4" priority="1">
+        <lane id="e3_0" index="0" speed="13.90" length="497.85" shape="-207.11,-102.33 205.89,175.67"/>
+    </edge>
+
+    <junction id="n0" type="dead_end" x="32.00" y="-9.00" incLanes="" intLanes="" shape="32.00,-9.00 31.34,-5.87"/>
+    <junction id="n1" type="priority" x="-72.00" y="-31.00" incLanes="e0_0" intLanes=":n1_0_0" shape="-70.02,-27.31 -69.36,-30.44 -70.94,-30.47 -71.59,-30.23 -72.15,-29.82 -72.62,-29.24 -73.00,-28.49">
+        <request index="0" response="0" foes="0" cont="0"/>
+    </junction>
+    <junction id="n2" type="priority" x="-120.00" y="90.00" incLanes="e1_0" intLanes=":n2_0_0" shape="-117.03,91.18 -120.00,90.00 -122.91,91.34 -121.87,93.22 -120.86,94.34 -119.87,94.69 -118.90,94.28 -117.95,93.11">
+        <request index="0" response="0" foes="0" cont="0"/>
+    </junction>
+    <junction id="n3" type="priority" x="-208.00" y="-101.00" incLanes="e2_0" intLanes=":n3_0_0" shape="-210.91,-99.66 -208.00,-101.00 -206.21,-103.65 -208.97,-105.31 -210.94,-106.04 -212.12,-105.84 -212.51,-104.71 -212.10,-102.65">
+        <request index="0" response="0" foes="0" cont="0"/>
+    </junction>
+    <junction id="n4" type="dead_end" x="205.00" y="177.00" incLanes="e3_0" intLanes="" shape="206.79,174.35 205.00,177.00"/>
+
+    <connection from="e0" to="e1" fromLane="0" toLane="0" via=":n1_0_0" dir="r" state="M"/>
+    <connection from="e1" to="e2" fromLane="0" toLane="0" via=":n2_0_0" dir="l" state="M"/>
+    <connection from="e2" to="e3" fromLane="0" toLane="0" via=":n3_0_0" dir="l" state="M"/>
+
+    <connection from=":n1_0" to="e1" fromLane="0" toLane="0" dir="r" state="M"/>
+    <connection from=":n2_0" to="e2" fromLane="0" toLane="0" dir="l" state="M"/>
+    <connection from=":n3_0" to="e3" fromLane="0" toLane="0" dir="l" state="M"/>
+
+</net>

@@ -1,7 +1,7 @@
 /*
  * Minimal proof-of-chain:
  *
- *   ns-3 UDP source UE -> Sionna-managed LTE hop -> eNB/EPC PGW
+ *   ns-3 TCP/UDP source UE -> Sionna-managed LTE hop -> eNB/EPC PGW
  *                       -> CSMA link -> ghost node -> Linux TAP
  *
  * The TapBridge is deliberately attached to a separate CSMA device on the
@@ -20,6 +20,8 @@
 #include "ns3/tap-bridge-module.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <chrono>
@@ -87,16 +89,17 @@ GetCoordinateIndex(const std::vector<CoordinatePacketStats>* stats)
 void
 LogClientTx(Ptr<const Packet> packet)
 {
-    NS_LOG_UNCOND("[udp-app-tx] t=" << Simulator::Now().As(Time::S)
+    NS_LOG_UNCOND("[app-tx] t=" << Simulator::Now().As(Time::S)
                                     << " size=" << packet->GetSize());
 }
 
 void
-LogServerRx(Ptr<const Packet> packet)
+LogSinkRx(Ptr<const Packet> packet, const Address& from)
 {
+    (void)from;
     NS_LOG_UNCOND("[ns3-ghost-rx] t=" << Simulator::Now().As(Time::S)
                                       << " size=" << packet->GetSize()
-                                      << " reached the ghost node UDP server");
+                                      << " reached the ghost node packet sink");
 }
 
 void
@@ -140,6 +143,58 @@ RecordTapSideRx(std::vector<CoordinatePacketStats>* stats, uint32_t minimumDataP
     }
     row.previousTapSideRx = now;
     row.lastTapSideRx = now;
+}
+
+void
+TcpCwndTracer(std::ofstream* stream, uint32_t oldValue, uint32_t newValue)
+{
+    if (stream && stream->is_open())
+    {
+        *stream << std::fixed << std::setprecision(9)
+                << Simulator::Now().GetSeconds() << "," << oldValue << "," << newValue << "\n";
+    }
+}
+
+void
+TcpRttTracer(std::ofstream* stream, Time oldValue, Time newValue)
+{
+    if (stream && stream->is_open())
+    {
+        *stream << std::fixed << std::setprecision(9)
+                << Simulator::Now().GetSeconds() << ","
+                << oldValue.GetMilliSeconds() << ","
+                << newValue.GetMilliSeconds() << "\n";
+    }
+}
+
+void
+TcpCongStateTracer(std::ofstream* stream,
+                   TcpSocketState::TcpCongState_t oldValue,
+                   TcpSocketState::TcpCongState_t newValue)
+{
+    if (stream && stream->is_open())
+    {
+        *stream << std::fixed << std::setprecision(9)
+                << Simulator::Now().GetSeconds() << ","
+                << static_cast<uint32_t>(oldValue) << ","
+                << static_cast<uint32_t>(newValue) << "\n";
+    }
+}
+
+void
+ConnectTcpTraces(uint32_t nodeId,
+                 std::ofstream* cwndStream,
+                 std::ofstream* rttStream,
+                 std::ofstream* retransmissionStream)
+{
+    const std::string socketPath =
+        "/NodeList/" + std::to_string(nodeId) + "/$ns3::TcpL4Protocol/SocketList/0/";
+    Config::ConnectWithoutContext(socketPath + "CongestionWindow",
+                                  MakeBoundCallback(&TcpCwndTracer, cwndStream));
+    Config::ConnectWithoutContext(socketPath + "RTT",
+                                  MakeBoundCallback(&TcpRttTracer, rttStream));
+    Config::ConnectWithoutContext(socketPath + "CongState",
+                                  MakeBoundCallback(&TcpCongStateTracer, retransmissionStream));
 }
 
 Vector
@@ -315,7 +370,7 @@ StartSystemTapPcap(pid_t* tcpdumpPid,
 }
 
 void
-PauseForManualCapture(double seconds, const std::string& tapName, uint16_t port)
+PauseForManualCapture(double seconds, const std::string& tapName, uint16_t port, std::string transport)
 {
     if (seconds <= 0.0)
     {
@@ -323,9 +378,11 @@ PauseForManualCapture(double seconds, const std::string& tapName, uint16_t port)
     }
 
     NS_LOG_UNCOND("  manual capture pause: TAP should be available as " << tapName);
-    NS_LOG_UNCOND("  run now: sudo tcpdump -i " << tapName << " -n -vv udp port " << port
-                                                << " -w " << tapName << "-udp" << port << ".pcap");
-    NS_LOG_UNCOND("  waiting " << seconds << " wall-clock seconds before UDP traffic continues");
+    NS_LOG_UNCOND("  run now: sudo tcpdump -i " << tapName << " -n -vv " << transport
+                                                << " port " << port
+                                                << " -w " << tapName << "-" << transport
+                                                << port << ".pcap");
+    NS_LOG_UNCOND("  waiting " << seconds << " wall-clock seconds before application traffic continues");
     std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
 }
 
@@ -389,17 +446,22 @@ main(int argc, char* argv[])
     bool sionnaVerbose = false;
     bool shutdownSionna = true;
     bool enableUePositionSequence = true;
+    bool enableTcpTraces = true;
     double simTime = 100.0;
     double uePositionInterval = 20.0;
-    double appStartTime = 3.0;
+    double appStart = 3.0;
+    double appStop = 0.0;
     double systemTapPcapStartTime = 1.0;
     double manualCapturePauseSeconds = 0.0;
     uint32_t packetSize = 512;
+    uint64_t maxBytes = 0;
     uint32_t maxPackets = 0;
     uint16_t port = 9000;
     std::string interval = "100ms";
     std::string dataRate = "40960bps";
-    std::string trafficApp = "UdpClient";
+    std::string transport = "tcp";
+    std::string tcpVariant = "TcpNewReno";
+    std::string trafficApp = "BulkSend";
     std::string sionnaServerIp = "127.0.0.1";
     std::string tapMode = "ConfigureLocal";
     std::string tapName = "sionna-tap0";
@@ -407,6 +469,9 @@ main(int argc, char* argv[])
     std::string pcapPrefix = "sionna-ns3-to-linux-tap-csma";
     std::string packetSummaryFile = "sionna-ns3-to-linux-tap-packet-summary.csv";
     std::string systemTapPcapFile = "sionna-tap0-udp9000.pcap";
+    std::string tcpCwndFile = "tcp_cwnd.csv";
+    std::string tcpRttFile = "tcp_rtt.csv";
+    std::string tcpRetransmissionsFile = "tcp_retransmissions.csv";
     std::string enbPosition = "49,-17,12";
     std::string uePositions = "32,-9,1.5;-72,-31,1.5;-120,90,1.5;-208,-101,1.5;205,177,1.5";
     double txPower = 23.0;
@@ -423,13 +488,18 @@ main(int argc, char* argv[])
     cmd.AddValue("shutdownSionna", "Ask the Sionna server to shut down when the simulation ends", shutdownSionna);
     cmd.AddValue("tapMode", "TapBridge mode: ConfigureLocal or UseLocal", tapMode);
     cmd.AddValue("tapName", "Linux TAP interface name", tapName);
-    cmd.AddValue("packetSize", "UDP payload size in bytes", packetSize);
+    cmd.AddValue("transport", "Transport protocol: tcp or udp", transport);
+    cmd.AddValue("tcpVariant", "TCP variant TypeId short name, e.g. TcpNewReno or TcpCubic", tcpVariant);
+    cmd.AddValue("packetSize", "Application packet/send size in bytes", packetSize);
+    cmd.AddValue("maxBytes", "TCP BulkSend MaxBytes; 0 means unlimited", maxBytes);
     cmd.AddValue("interval", "UDP client packet interval, e.g. 100ms", interval);
     cmd.AddValue("dataRate", "OnOffApplication data rate, e.g. 40960bps", dataRate);
-    cmd.AddValue("trafficApp", "Traffic generator: UdpClient or OnOff", trafficApp);
-    cmd.AddValue("port", "Destination UDP port", port);
+    cmd.AddValue("trafficApp", "Traffic generator: BulkSend, OnOff, or UdpClient", trafficApp);
+    cmd.AddValue("port", "Destination TCP/UDP port", port);
     cmd.AddValue("simTime", "Simulation duration in seconds", simTime);
-    cmd.AddValue("appStartTime", "Application start time in seconds", appStartTime);
+    cmd.AddValue("appStart", "Application start time in seconds", appStart);
+    cmd.AddValue("appStartTime", "Backward-compatible alias for appStart", appStart);
+    cmd.AddValue("appStop", "Application stop time in seconds; 0 means simTime", appStop);
     cmd.AddValue("enbPosition", "LTE eNB position as x,y,z", enbPosition);
     cmd.AddValue("uePositions", "Semicolon-separated LTE UE positions as x,y,z;x,y,z", uePositions);
     cmd.AddValue("enableUePositionSequence", "Move the UE through uePositions during the run", enableUePositionSequence);
@@ -451,17 +521,49 @@ main(int argc, char* argv[])
                  enableStaticNeighborCache);
     cmd.AddValue("enableFlowMonitor", "Write FlowMonitor XML output", enableFlowMonitor);
     cmd.AddValue("flowMonitorFile", "FlowMonitor XML output path", flowMonitorFile);
+    cmd.AddValue("enableTcpTraces", "Write TCP cwnd/RTT/congestion-state trace CSV files", enableTcpTraces);
+    cmd.AddValue("tcpCwndFile", "TCP congestion window CSV output path", tcpCwndFile);
+    cmd.AddValue("tcpRttFile", "TCP RTT CSV output path", tcpRttFile);
+    cmd.AddValue("tcpRetransmissionsFile", "TCP congestion-state/retransmission event CSV output path", tcpRetransmissionsFile);
     cmd.AddValue("txPower", "LTE UE/eNB TX power in dBm", txPower);
     cmd.AddValue("earfcn", "LTE DL EARFCN; default 100 is near 2.1 GHz", earfcn);
     cmd.Parse(argc, argv);
 
+    std::transform(transport.begin(), transport.end(), transport.begin(), [](unsigned char c) {
+        return std::tolower(c);
+    });
+    if (appStop == 0.0)
+    {
+        appStop = simTime;
+    }
+    if (trafficApp == "UdpClient")
+    {
+        transport = "udp";
+    }
+    if (transport == "udp" && trafficApp == "BulkSend")
+    {
+        trafficApp = "UdpClient";
+    }
+    if (transport == "tcp" && trafficApp == "UdpClient")
+    {
+        trafficApp = "BulkSend";
+    }
+
     NS_ABORT_MSG_IF(tapMode != "ConfigureLocal" && tapMode != "UseLocal",
                     "tapMode must be ConfigureLocal or UseLocal");
-    NS_ABORT_MSG_IF(trafficApp != "UdpClient" && trafficApp != "OnOff",
-                    "trafficApp must be UdpClient or OnOff");
+    NS_ABORT_MSG_IF(transport != "tcp" && transport != "udp",
+                    "transport must be tcp or udp");
+    NS_ABORT_MSG_IF(trafficApp != "BulkSend" && trafficApp != "UdpClient" && trafficApp != "OnOff",
+                    "trafficApp must be BulkSend, UdpClient, or OnOff");
+    NS_ABORT_MSG_IF(transport == "udp" && trafficApp == "BulkSend",
+                    "BulkSend requires TCP; use --transport=tcp or --trafficApp=OnOff");
+    NS_ABORT_MSG_IF(transport == "tcp" && trafficApp == "UdpClient",
+                    "UdpClient requires UDP; use --transport=udp or --trafficApp=BulkSend/OnOff");
     NS_ABORT_MSG_IF(simTime <= 1.0, "simTime must be greater than one second");
-    NS_ABORT_MSG_IF(appStartTime < 0.0 || appStartTime >= simTime,
-                    "appStartTime must be non-negative and less than simTime");
+    NS_ABORT_MSG_IF(appStart < 0.0 || appStart >= simTime,
+                    "appStart must be non-negative and less than simTime");
+    NS_ABORT_MSG_IF(appStop <= appStart || appStop > simTime,
+                    "appStop must be greater than appStart and no greater than simTime");
     NS_ABORT_MSG_IF(systemTapPcapStartTime < 0.0 || systemTapPcapStartTime >= simTime,
                     "systemTapPcapStartTime must be non-negative and less than simTime");
     NS_ABORT_MSG_IF(uePositionInterval <= 0.0, "uePositionInterval must be positive");
@@ -475,6 +577,12 @@ main(int argc, char* argv[])
     // exchange real Ethernet frames with the Linux network stack through TAP.
     GlobalValue::Bind("SimulatorImplementationType", StringValue("ns3::RealtimeSimulatorImpl"));
     GlobalValue::Bind("ChecksumEnabled", BooleanValue(true));
+    if (transport == "tcp")
+    {
+        Config::SetDefault("ns3::TcpL4Protocol::SocketType",
+                           TypeIdValue(TypeId::LookupByName("ns3::" + tcpVariant)));
+        Config::SetDefault("ns3::TcpSocket::SegmentSize", UintegerValue(packetSize));
+    }
 
     if (enableSionna)
     {
@@ -580,26 +688,28 @@ main(int argc, char* argv[])
     const Time packetInterval = Time(interval);
     if (maxPackets == 0)
     {
-        const double activeSeconds = simTime - appStartTime;
+        const double activeSeconds = appStop - appStart;
         maxPackets = static_cast<uint32_t>(activeSeconds / packetInterval.GetSeconds()) + 1;
     }
 
     if (!enableTap)
     {
-        UdpServerHelper server(port);
-        ApplicationContainer serverApps = server.Install(ghostNode.Get(0));
+        const std::string socketFactory =
+            transport == "tcp" ? "ns3::TcpSocketFactory" : "ns3::UdpSocketFactory";
+        PacketSinkHelper sink(socketFactory, InetSocketAddress(Ipv4Address::GetAny(), port));
+        ApplicationContainer serverApps = sink.Install(ghostNode.Get(0));
         serverApps.Start(Seconds(0.5));
         serverApps.Stop(Seconds(simTime));
 
-        Ptr<UdpServer> udpServer = DynamicCast<UdpServer>(serverApps.Get(0));
-        if (udpServer)
+        Ptr<PacketSink> packetSink = DynamicCast<PacketSink>(serverApps.Get(0));
+        if (packetSink)
         {
-            udpServer->TraceConnectWithoutContext("Rx", MakeCallback(&LogServerRx));
+            packetSink->TraceConnectWithoutContext("Rx", MakeCallback(&LogSinkRx));
         }
     }
 
     ApplicationContainer clientApps;
-    if (trafficApp == "UdpClient")
+    if (transport == "udp" && trafficApp == "UdpClient")
     {
         UdpClientHelper client(destinationIp, port);
         client.SetAttribute("MaxPackets", UintegerValue(maxPackets));
@@ -613,9 +723,25 @@ main(int argc, char* argv[])
             udpClient->TraceConnectWithoutContext("Tx", MakeBoundCallback(&RecordAppTx, &packetStats));
         }
     }
+    else if (transport == "tcp" && trafficApp == "BulkSend")
+    {
+        BulkSendHelper bulkSend("ns3::TcpSocketFactory", InetSocketAddress(destinationIp, port));
+        bulkSend.SetAttribute("SendSize", UintegerValue(packetSize));
+        bulkSend.SetAttribute("MaxBytes", UintegerValue(maxBytes));
+
+        clientApps = bulkSend.Install(sourceNode);
+        Ptr<BulkSendApplication> bulkSendApp = DynamicCast<BulkSendApplication>(clientApps.Get(0));
+        if (bulkSendApp)
+        {
+            bulkSendApp->TraceConnectWithoutContext("Tx",
+                                                    MakeBoundCallback(&RecordAppTx, &packetStats));
+        }
+    }
     else
     {
-        OnOffHelper onoff("ns3::UdpSocketFactory", InetSocketAddress(destinationIp, port));
+        const std::string socketFactory =
+            transport == "tcp" ? "ns3::TcpSocketFactory" : "ns3::UdpSocketFactory";
+        OnOffHelper onoff(socketFactory, InetSocketAddress(destinationIp, port));
         onoff.SetAttribute("PacketSize", UintegerValue(packetSize));
         onoff.SetAttribute("DataRate", DataRateValue(DataRate(dataRate)));
         onoff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
@@ -628,8 +754,36 @@ main(int argc, char* argv[])
             onOff->TraceConnectWithoutContext("Tx", MakeBoundCallback(&RecordAppTx, &packetStats));
         }
     }
-    clientApps.Start(Seconds(appStartTime));
-    clientApps.Stop(Seconds(simTime));
+    clientApps.Start(Seconds(appStart));
+    clientApps.Stop(Seconds(appStop));
+
+    std::ofstream tcpCwndStream;
+    std::ofstream tcpRttStream;
+    std::ofstream tcpRetransmissionsStream;
+    if (transport == "tcp" && enableTcpTraces)
+    {
+        tcpCwndStream.open(tcpCwndFile);
+        tcpRttStream.open(tcpRttFile);
+        tcpRetransmissionsStream.open(tcpRetransmissionsFile);
+        if (tcpCwndStream.is_open())
+        {
+            tcpCwndStream << "time_seconds,old_cwnd_bytes,new_cwnd_bytes\n";
+        }
+        if (tcpRttStream.is_open())
+        {
+            tcpRttStream << "time_seconds,old_rtt_ms,new_rtt_ms\n";
+        }
+        if (tcpRetransmissionsStream.is_open())
+        {
+            tcpRetransmissionsStream << "time_seconds,old_congestion_state,new_congestion_state\n";
+        }
+        Simulator::Schedule(Seconds(appStart + 0.001),
+                            &ConnectTcpTraces,
+                            sourceNode->GetId(),
+                            &tcpCwndStream,
+                            &tcpRttStream,
+                            &tcpRetransmissionsStream);
+    }
 
     wiredDevices.Get(1)->TraceConnectWithoutContext(
         "MacRx",
@@ -664,12 +818,13 @@ main(int argc, char* argv[])
     if (enableTap && manualCapturePauseSeconds > 0.0)
     {
         const double pauseTime =
-            std::max(0.1, std::min(appStartTime - 0.1, systemTapPcapStartTime + 0.5));
+            std::max(0.1, std::min(appStart - 0.1, systemTapPcapStartTime + 0.5));
         Simulator::Schedule(Seconds(pauseTime),
                             &PauseForManualCapture,
                             manualCapturePauseSeconds,
                             tapName,
-                            port);
+                            port,
+                            transport);
     }
 
     NS_LOG_UNCOND("Sionna LTE ns-3 to Linux TAP proof-of-chain");
@@ -682,12 +837,15 @@ main(int argc, char* argv[])
     NS_LOG_UNCOND("  UE IP=" << sourceIp << " EPC default gateway="
                              << epcHelper->GetUeDefaultGatewayAddress());
     NS_LOG_UNCOND("  PGW wired IP=" << gatewayWiredIp << " destination IP=" << destinationIp);
-    NS_LOG_UNCOND("  UDP destination=" << destinationIp << ":" << port
-                                       << " app=" << trafficApp
-                                       << " packetSize=" << packetSize
-                                       << " interval=" << interval
-                                       << " dataRate=" << dataRate
-                                       << " appStartTime=" << appStartTime << "s");
+    NS_LOG_UNCOND("  " << transport << " destination=" << destinationIp << ":" << port
+                       << " app=" << trafficApp
+                       << " tcpVariant=" << tcpVariant
+                       << " packetSize=" << packetSize
+                       << " maxBytes=" << maxBytes
+                       << " interval=" << interval
+                       << " dataRate=" << dataRate
+                       << " appStart=" << appStart << "s"
+                       << " appStop=" << appStop << "s");
     NS_LOG_UNCOND("  TapBridge enabled=" << (enableTap ? "true" : "false")
                                          << " mode=" << tapMode
                                          << " tapName=" << tapName);
@@ -704,8 +862,10 @@ main(int argc, char* argv[])
                   << " file=" << systemTapPcapFile
                   << " startTime=" << systemTapPcapStartTime << "s");
     NS_LOG_UNCOND("  manual capture pause=" << manualCapturePauseSeconds << "s");
-    NS_LOG_UNCOND("  expected tcpdump: sudo tcpdump -i " << tapName << " -n -vv udp port " << port);
-    NS_LOG_UNCOND("  expected listener: nc -ul " << port);
+    NS_LOG_UNCOND("  expected tcpdump: sudo tcpdump -i " << tapName << " -n -vv "
+                                              << transport << " port " << port);
+    NS_LOG_UNCOND("  expected listener: "
+                  << (transport == "tcp" ? "nc -l " : "nc -ul ") << port);
 
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
@@ -718,6 +878,12 @@ main(int argc, char* argv[])
     if (enablePcap)
     {
         NS_LOG_UNCOND("  wrote CSMA/TAP-side PCAP files with prefix: " << pcapPrefix);
+    }
+    if (transport == "tcp" && enableTcpTraces)
+    {
+        NS_LOG_UNCOND("  wrote TCP cwnd trace: " << tcpCwndFile);
+        NS_LOG_UNCOND("  wrote TCP RTT trace: " << tcpRttFile);
+        NS_LOG_UNCOND("  wrote TCP congestion-state trace: " << tcpRetransmissionsFile);
     }
     if (enablePacketSummary)
     {
