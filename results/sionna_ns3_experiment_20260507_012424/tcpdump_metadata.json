@@ -1,0 +1,27 @@
+{
+  "enabled": true,
+  "status": "completed",
+  "pcap": "/home/luksona/WorkingFiles/sionna_files/SionnaNsRT/results/sionna_ns3_experiment_20260507_012424/raw/tcpdump_route.pcap",
+  "stdout_log": "results/sionna_ns3_experiment_20260507_012424/raw/tcpdump_stdout.log",
+  "stderr_log": "results/sionna_ns3_experiment_20260507_012424/raw/tcpdump_stderr.log",
+  "interface": "any",
+  "filter": "tcp port 9000",
+  "command": [
+    "sudo",
+    "-S",
+    "tcpdump",
+    "-i",
+    "any",
+    "-n",
+    "-s",
+    "0",
+    "-w",
+    "/home/luksona/WorkingFiles/sionna_files/SionnaNsRT/results/sionna_ns3_experiment_20260507_012424/raw/tcpdump_route.pcap",
+    "tcp",
+    "port",
+    "9000"
+  ],
+  "warnings": [],
+  "returncode": 0,
+  "pcap_size_bytes": 431764
+}

@@ -1,0 +1,13 @@
+{
+  "skipped_plots": {
+    "valid_paths_vs_step.png": "No varying finite samples available",
+    "los_vs_step.png": "No varying finite samples available",
+    "delay_spread_vs_step.png": "No varying finite samples available",
+    "delay_vs_coordinate.png": "No varying finite samples available",
+    "jitter_vs_coordinate.png": "No varying finite samples available",
+    "valid_paths_vs_coordinate.png": "No varying finite samples available",
+    "tcp_cwnd_vs_coordinate.png": "No varying finite samples available",
+    "tcp_rtt_vs_coordinate.png": "No varying finite samples available"
+  },
+  "note": "Plots with fewer than two finite points or with a constant y-series are skipped to avoid misleading flat/empty charts."
+}

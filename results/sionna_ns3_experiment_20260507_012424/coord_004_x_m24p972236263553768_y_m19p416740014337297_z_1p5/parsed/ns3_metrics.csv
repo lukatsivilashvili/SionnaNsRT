@@ -1,0 +1,2 @@
+throughput_mbps,packet_delivery_ratio,packet_loss_ratio,average_delay_ms,average_jitter_ms,lostPackets,mean_tap_side_rx_interarrival_s,packet_window_end_s,packet_window_start_s,rxBytes,rxPackets,txBytes,txPackets
+0.031039999999999988,1.5,0.0,,,0,0.053768408,5.5,4.6,3492,6,2048,4

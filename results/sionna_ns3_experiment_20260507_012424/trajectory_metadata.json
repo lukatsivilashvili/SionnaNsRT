@@ -1,0 +1,28 @@
+{
+  "sumo_used": true,
+  "sumo_config": "results/sionna_ns3_experiment_20260507_012424/sumo_cnam_scenario/cnam.sumocfg",
+  "vehicle_id": "car_1",
+  "number_of_raw_sumo_points": 20,
+  "number_of_sampled_rx_points": 20,
+  "sumo_step_length": 1.0,
+  "sumo_skip_steps": 0,
+  "sumo_max_coordinates": 20,
+  "sionna_recomputed_per_sampled_position": false,
+  "sionna_evaluation_mode": "single_ns3_trajectory_run_with_scheduled_ue_position_updates_and_on_request_radio_map_exports",
+  "los_detection_available": true,
+  "ns3_run_per_step": false,
+  "ns3_flowmonitor_metrics_are_per_step": false,
+  "ns3_packet_summary_metrics_are_per_step": true,
+  "warnings": [
+    "No Sionna summary row was produced for this sampled RX position",
+    "channel frequency response unavailable from current exported Sionna summary",
+    "distance_from_tx_m unavailable",
+    "interaction type counts unavailable from current exported Sionna summary",
+    "path_coefficients unavailable from current exported Sionna summary",
+    "path_delays_ns unavailable from current exported Sionna summary",
+    "path_gain_dB unavailable",
+    "power delay profile unavailable from current exported Sionna summary",
+    "rss_dBm unavailable",
+    "sinr_dB unavailable"
+  ]
+}

@@ -28,6 +28,9 @@
 #include <iomanip>
 #include <limits>
 #include <signal.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <sys/types.h>
@@ -68,6 +71,34 @@ PositionToString(const Vector& position)
     std::ostringstream oss;
     oss << "(" << position.x << ", " << position.y << ", " << position.z << ")";
     return oss.str();
+}
+
+std::string
+TrimCommandLineQuotes(std::string text)
+{
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())))
+    {
+        text.erase(text.begin());
+    }
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back())))
+    {
+        text.pop_back();
+    }
+    if (text.size() >= 2 &&
+        ((text.front() == '\'' && text.back() == '\'') ||
+         (text.front() == '"' && text.back() == '"')))
+    {
+        return text.substr(1, text.size() - 2);
+    }
+    if (!text.empty() && (text.front() == '\'' || text.front() == '"'))
+    {
+        text.erase(text.begin());
+    }
+    if (!text.empty() && (text.back() == '\'' || text.back() == '"'))
+    {
+        text.pop_back();
+    }
+    return text;
 }
 
 uint32_t
@@ -200,7 +231,7 @@ ConnectTcpTraces(uint32_t nodeId,
 Vector
 ParseVector(const std::string& text)
 {
-    std::stringstream stream(text);
+    std::stringstream stream(TrimCommandLineQuotes(text));
     std::string part;
     std::vector<double> values;
     while (std::getline(stream, part, ','))
@@ -214,17 +245,37 @@ ParseVector(const std::string& text)
 std::vector<Vector>
 ParsePositionList(const std::string& text)
 {
-    std::stringstream stream(text);
+    std::stringstream stream(TrimCommandLineQuotes(text));
     std::string item;
     std::vector<Vector> positions;
     while (std::getline(stream, item, ';'))
     {
         if (!item.empty())
         {
-            positions.push_back(ParseVector(item));
+            positions.push_back(ParseVector(TrimCommandLineQuotes(item)));
         }
     }
     NS_ABORT_MSG_IF(positions.empty(), "uePositions must contain at least one x,y,z position");
+    return positions;
+}
+
+std::vector<Vector>
+ParsePositionFile(const std::string& filename)
+{
+    std::ifstream file(filename);
+    NS_ABORT_MSG_IF(!file.is_open(), "Could not open uePositionsFile: " << filename);
+    std::string line;
+    std::vector<Vector> positions;
+    while (std::getline(file, line))
+    {
+        line = TrimCommandLineQuotes(line);
+        if (line.empty() || line[0] == '#')
+        {
+            continue;
+        }
+        positions.push_back(ParseVector(line));
+    }
+    NS_ABORT_MSG_IF(positions.empty(), "uePositionsFile must contain at least one x,y,z position");
     return positions;
 }
 
@@ -232,6 +283,7 @@ std::vector<CoordinatePacketStats>
 CreateCoordinateStats(const std::vector<Vector>& uePositionList,
                       bool enableUePositionSequence,
                       double uePositionInterval,
+                      double uePositionStartTime,
                       double simTime)
 {
     const uint32_t count = enableUePositionSequence ? uePositionList.size() : 1;
@@ -242,8 +294,16 @@ CreateCoordinateStats(const std::vector<Vector>& uePositionList,
         CoordinatePacketStats row;
         row.index = i;
         row.uePosition = uePositionList[i];
-        row.windowStart = enableUePositionSequence ? i * uePositionInterval : 0.0;
-        row.windowEnd = enableUePositionSequence ? std::min((i + 1) * uePositionInterval, simTime) : simTime;
+        if (enableUePositionSequence)
+        {
+            row.windowStart = (i == 0) ? 0.0 : uePositionStartTime + i * uePositionInterval;
+            row.windowEnd = std::min(uePositionStartTime + (i + 1) * uePositionInterval, simTime);
+        }
+        else
+        {
+            row.windowStart = 0.0;
+            row.windowEnd = simTime;
+        }
         if (i == count - 1)
         {
             row.windowEnd = simTime;
@@ -301,6 +361,67 @@ WritePacketSummaryCsv(const std::string& filename,
             << row.lastTapSideRx << ","
             << meanInterarrival << "\n";
     }
+}
+
+void
+RequestSionnaRadioMapExport(const std::string& serverIp,
+                            uint16_t serverPort,
+                            double timeoutSeconds,
+                            uint32_t coordinateIndex)
+{
+    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+    {
+        NS_LOG_UNCOND("[sionna-export] coordinate=" << coordinateIndex
+                                                    << " skipped: could not create UDP socket");
+        return;
+    }
+
+    timeval timeout;
+    timeout.tv_sec = static_cast<long>(timeoutSeconds);
+    timeout.tv_usec = static_cast<long>((timeoutSeconds - timeout.tv_sec) * 1000000.0);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    sockaddr_in address;
+    std::memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(serverPort);
+    if (inet_pton(AF_INET, serverIp.c_str(), &address.sin_addr) != 1)
+    {
+        NS_LOG_UNCOND("[sionna-export] coordinate=" << coordinateIndex
+                                                    << " skipped: invalid server IP " << serverIp);
+        close(fd);
+        return;
+    }
+
+    const char* message = "EXPORT_RADIO_MAP";
+    const ssize_t sent = sendto(fd,
+                                message,
+                                std::strlen(message),
+                                0,
+                                reinterpret_cast<sockaddr*>(&address),
+                                sizeof(address));
+    if (sent < 0)
+    {
+        NS_LOG_UNCOND("[sionna-export] coordinate=" << coordinateIndex
+                                                    << " skipped: sendto failed");
+        close(fd);
+        return;
+    }
+
+    char buffer[256] = {0};
+    const ssize_t received = recvfrom(fd, buffer, sizeof(buffer) - 1, 0, nullptr, nullptr);
+    if (received > 0)
+    {
+        NS_LOG_UNCOND("[sionna-export] coordinate=" << coordinateIndex
+                                                    << " response=" << buffer);
+    }
+    else
+    {
+        NS_LOG_UNCOND("[sionna-export] coordinate=" << coordinateIndex
+                                                    << " timed out waiting for radio-map export");
+    }
+    close(fd);
 }
 
 void
@@ -446,17 +567,22 @@ main(int argc, char* argv[])
     bool sionnaVerbose = false;
     bool shutdownSionna = true;
     bool enableUePositionSequence = true;
+    bool enableSionnaExportSequence = false;
     bool enableTcpTraces = true;
     double simTime = 100.0;
     double uePositionInterval = 20.0;
+    double uePositionStartTime = 0.0;
     double appStart = 3.0;
     double appStop = 0.0;
+    double sionnaExportDelay = 0.05;
+    double sionnaExportTimeout = 600.0;
     double systemTapPcapStartTime = 1.0;
     double manualCapturePauseSeconds = 0.0;
     uint32_t packetSize = 512;
     uint64_t maxBytes = 0;
     uint32_t maxPackets = 0;
     uint16_t port = 9000;
+    uint16_t sionnaExportPort = 8103;
     std::string interval = "100ms";
     std::string dataRate = "40960bps";
     std::string transport = "tcp";
@@ -464,7 +590,8 @@ main(int argc, char* argv[])
     std::string trafficApp = "BulkSend";
     std::string sionnaServerIp = "127.0.0.1";
     std::string tapMode = "ConfigureLocal";
-    std::string tapName = "sionna-tap0";
+    std::string tapName = "tap0";
+    std::string tapMac = "02:00:00:00:02:02";
     std::string flowMonitorFile = "sionna-ns3-to-linux-tap.flowmon.xml";
     std::string pcapPrefix = "sionna-ns3-to-linux-tap-csma";
     std::string packetSummaryFile = "sionna-ns3-to-linux-tap-packet-summary.csv";
@@ -472,8 +599,10 @@ main(int argc, char* argv[])
     std::string tcpCwndFile = "tcp_cwnd.csv";
     std::string tcpRttFile = "tcp_rtt.csv";
     std::string tcpRetransmissionsFile = "tcp_retransmissions.csv";
+    std::string topologyMetadataFile = "ns3_to_tap_topology.json";
     std::string enbPosition = "49,-17,12";
     std::string uePositions = "32,-9,1.5;-72,-31,1.5;-120,90,1.5;-208,-101,1.5;205,177,1.5";
+    std::string uePositionsFile = "";
     double txPower = 23.0;
     uint16_t earfcn = 100;
 
@@ -488,6 +617,7 @@ main(int argc, char* argv[])
     cmd.AddValue("shutdownSionna", "Ask the Sionna server to shut down when the simulation ends", shutdownSionna);
     cmd.AddValue("tapMode", "TapBridge mode: ConfigureLocal or UseLocal", tapMode);
     cmd.AddValue("tapName", "Linux TAP interface name", tapName);
+    cmd.AddValue("tapMac", "MAC address used for both Linux TAP and ns-3 output device in UseLocal mode", tapMac);
     cmd.AddValue("transport", "Transport protocol: tcp or udp", transport);
     cmd.AddValue("tcpVariant", "TCP variant TypeId short name, e.g. TcpNewReno or TcpCubic", tcpVariant);
     cmd.AddValue("packetSize", "Application packet/send size in bytes", packetSize);
@@ -502,8 +632,14 @@ main(int argc, char* argv[])
     cmd.AddValue("appStop", "Application stop time in seconds; 0 means simTime", appStop);
     cmd.AddValue("enbPosition", "LTE eNB position as x,y,z", enbPosition);
     cmd.AddValue("uePositions", "Semicolon-separated LTE UE positions as x,y,z;x,y,z", uePositions);
+    cmd.AddValue("uePositionsFile", "Text file containing one LTE UE position x,y,z per line", uePositionsFile);
     cmd.AddValue("enableUePositionSequence", "Move the UE through uePositions during the run", enableUePositionSequence);
     cmd.AddValue("uePositionInterval", "Seconds between UE position changes", uePositionInterval);
+    cmd.AddValue("uePositionStartTime", "Simulation time for the first scheduled UE movement after the initial position", uePositionStartTime);
+    cmd.AddValue("enableSionnaExportSequence", "Request Sionna radio-map export after each scheduled UE position", enableSionnaExportSequence);
+    cmd.AddValue("sionnaExportPort", "UDP port of the Sionna server used for on-request radio-map export", sionnaExportPort);
+    cmd.AddValue("sionnaExportDelay", "Delay after each UE position update before requesting radio-map export", sionnaExportDelay);
+    cmd.AddValue("sionnaExportTimeout", "Wall-clock seconds to wait for each Sionna radio-map export response", sionnaExportTimeout);
     cmd.AddValue("maxPackets", "UDP client max packets; 0 derives from simTime/interval", maxPackets);
     cmd.AddValue("enablePcap", "Enable LTE and CSMA tracing", enablePcap);
     cmd.AddValue("pcapPrefix", "PCAP filename prefix for the CSMA/TAP-facing link", pcapPrefix);
@@ -525,6 +661,7 @@ main(int argc, char* argv[])
     cmd.AddValue("tcpCwndFile", "TCP congestion window CSV output path", tcpCwndFile);
     cmd.AddValue("tcpRttFile", "TCP RTT CSV output path", tcpRttFile);
     cmd.AddValue("tcpRetransmissionsFile", "TCP congestion-state/retransmission event CSV output path", tcpRetransmissionsFile);
+    cmd.AddValue("topologyMetadataFile", "JSON metadata describing the ns-3 -> Sionna -> TAP topology", topologyMetadataFile);
     cmd.AddValue("txPower", "LTE UE/eNB TX power in dBm", txPower);
     cmd.AddValue("earfcn", "LTE DL EARFCN; default 100 is near 2.1 GHz", earfcn);
     cmd.Parse(argc, argv);
@@ -567,11 +704,19 @@ main(int argc, char* argv[])
     NS_ABORT_MSG_IF(systemTapPcapStartTime < 0.0 || systemTapPcapStartTime >= simTime,
                     "systemTapPcapStartTime must be non-negative and less than simTime");
     NS_ABORT_MSG_IF(uePositionInterval <= 0.0, "uePositionInterval must be positive");
+    NS_ABORT_MSG_IF(uePositionStartTime < 0.0 || uePositionStartTime >= simTime,
+                    "uePositionStartTime must be non-negative and less than simTime");
+    NS_ABORT_MSG_IF(sionnaExportDelay < 0.0, "sionnaExportDelay must be non-negative");
 
     const Vector enbVector = ParseVector(enbPosition);
-    const std::vector<Vector> uePositionList = ParsePositionList(uePositions);
+    const std::vector<Vector> uePositionList =
+        uePositionsFile.empty() ? ParsePositionList(uePositions) : ParsePositionFile(uePositionsFile);
     std::vector<CoordinatePacketStats> packetStats =
-        CreateCoordinateStats(uePositionList, enableUePositionSequence, uePositionInterval, simTime);
+        CreateCoordinateStats(uePositionList,
+                              enableUePositionSequence,
+                              uePositionInterval,
+                              uePositionStartTime,
+                              simTime);
 
     // Real-time scheduling and checksums are needed because this simulation can
     // exchange real Ethernet frames with the Linux network stack through TAP.
@@ -614,15 +759,39 @@ main(int argc, char* argv[])
 
     Simulator::Schedule(Seconds(0.0), &SetNodePosition, sourceNode, uePositionList.front(), "UE car_1");
     Simulator::Schedule(Seconds(0.0), &SetNodePosition, enbNode, enbVector, "eNB car_2");
+    if (enableSionna && enableSionnaExportSequence &&
+        uePositionStartTime + sionnaExportDelay < simTime)
+    {
+        Simulator::Schedule(Seconds(uePositionStartTime + sionnaExportDelay),
+                            &RequestSionnaRadioMapExport,
+                            sionnaServerIp,
+                            sionnaExportPort,
+                            sionnaExportTimeout,
+                            0);
+    }
     if (enableUePositionSequence)
     {
         for (uint32_t i = 1; i < uePositionList.size(); ++i)
         {
-            Simulator::Schedule(Seconds(i * uePositionInterval),
+            const double moveTime = uePositionStartTime + i * uePositionInterval;
+            if (moveTime >= simTime)
+            {
+                continue;
+            }
+            Simulator::Schedule(Seconds(moveTime),
                                 &SetNodePosition,
                                 sourceNode,
                                 uePositionList[i],
                                 "UE car_1");
+            if (enableSionna && enableSionnaExportSequence && moveTime + sionnaExportDelay < simTime)
+            {
+                Simulator::Schedule(Seconds(moveTime + sionnaExportDelay),
+                                    &RequestSionnaRadioMapExport,
+                                    sionnaServerIp,
+                                    sionnaExportPort,
+                                    sionnaExportTimeout,
+                                    i);
+            }
         }
     }
 
@@ -657,6 +826,10 @@ main(int argc, char* argv[])
     csma.SetChannelAttribute("DataRate", DataRateValue(DataRate("100Mbps")));
     csma.SetChannelAttribute("Delay", TimeValue(MilliSeconds(1)));
     NetDeviceContainer wiredDevices = csma.Install(wiredNodes);
+    if (enableTap && tapMode == "UseLocal")
+    {
+        wiredDevices.Get(1)->SetAddress(Mac48Address(tapMac.c_str()));
+    }
 
     Ipv4AddressHelper wiredIpv4;
     wiredIpv4.SetBase("10.10.2.0", "255.255.255.0");
@@ -828,6 +1001,8 @@ main(int argc, char* argv[])
     }
 
     NS_LOG_UNCOND("Sionna LTE ns-3 to Linux TAP proof-of-chain");
+    NS_LOG_UNCOND("  traffic direction=ns3_to_tap");
+    NS_LOG_UNCOND("  topology: ns-3 UE app -> Sionna-managed LTE channel -> eNB/EPC PGW -> CSMA output link -> TapBridge -> Linux " << tapName);
     NS_LOG_UNCOND("  source nodeId=" << sourceNode->GetId() << " Sionna object=car_1"
                                       << " position="
                                       << PositionToString(sourceNode->GetObject<MobilityModel>()->GetPosition()));
@@ -848,11 +1023,16 @@ main(int argc, char* argv[])
                        << " appStop=" << appStop << "s");
     NS_LOG_UNCOND("  TapBridge enabled=" << (enableTap ? "true" : "false")
                                          << " mode=" << tapMode
-                                         << " tapName=" << tapName);
+                                         << " tapName=" << tapName
+                                         << " tapMac=" << tapMac);
     NS_LOG_UNCOND("  static PGW/TAP ARP cache=" << (enableStaticNeighborCache ? "true" : "false"));
     NS_LOG_UNCOND("  UE position sequence enabled=" << (enableUePositionSequence ? "true" : "false")
                                                     << " interval=" << uePositionInterval
+                                                    << "s startTime=" << uePositionStartTime
                                                     << "s count=" << uePositionList.size());
+    NS_LOG_UNCOND("  Sionna export sequence enabled=" << (enableSionna && enableSionnaExportSequence ? "true" : "false")
+                                                      << " exportDelay=" << sionnaExportDelay
+                                                      << "s exportPort=" << sionnaExportPort);
     NS_LOG_UNCOND("  PCAP enabled=" << (enablePcap ? "true" : "false")
                                     << " prefix=" << pcapPrefix);
     NS_LOG_UNCOND("  packet summary enabled=" << (enablePacketSummary ? "true" : "false")
@@ -866,6 +1046,39 @@ main(int argc, char* argv[])
                                               << transport << " port " << port);
     NS_LOG_UNCOND("  expected listener: "
                   << (transport == "tcp" ? "nc -l " : "nc -ul ") << port);
+
+    if (!topologyMetadataFile.empty())
+    {
+        std::ofstream topology(topologyMetadataFile);
+        if (topology.is_open())
+        {
+            topology << "{\n";
+            topology << "  \"traffic_direction\": \"ns3_to_tap\",\n";
+            topology << "  \"transport\": \"" << transport << "\",\n";
+            topology << "  \"tap_enabled\": " << (enableTap ? "true" : "false") << ",\n";
+            topology << "  \"tap_name\": \"" << tapName << "\",\n";
+            topology << "  \"tap_mode\": \"" << tapMode << "\",\n";
+            topology << "  \"tap_mac\": \"" << tapMac << "\",\n";
+            topology << "  \"source_node\": \"UE car_1\",\n";
+            topology << "  \"source_ip\": \"" << sourceIp << "\",\n";
+            topology << "  \"sionna_channel\": \"LTE UE car_1 to eNB car_2 via SionnaHelper\",\n";
+            topology << "  \"sionna_tx_object\": \"car_1\",\n";
+            topology << "  \"sionna_rx_object\": \"car_2\",\n";
+            topology << "  \"output_node\": \"ghost/TapBridge side\",\n";
+            topology << "  \"pgw_wired_ip\": \"" << gatewayWiredIp << "\",\n";
+            topology << "  \"tap_destination_ip\": \"" << destinationIp << "\",\n";
+            topology << "  \"ue_position_sequence_enabled\": " << (enableUePositionSequence ? "true" : "false") << ",\n";
+            topology << "  \"ue_position_count\": " << uePositionList.size() << ",\n";
+            topology << "  \"ue_position_interval_s\": " << uePositionInterval << ",\n";
+            topology << "  \"ue_position_start_time_s\": " << uePositionStartTime << ",\n";
+            topology << "  \"sionna_export_sequence_enabled\": " << (enableSionna && enableSionnaExportSequence ? "true" : "false") << ",\n";
+            topology << "  \"port\": " << port << ",\n";
+            topology << "  \"tap_tcpdump_command\": \"sudo tcpdump -i " << tapName << " -n -vv " << transport << " port " << port << "\",\n";
+            topology << "  \"host_listener_command\": \"" << (transport == "tcp" ? "nc -l " : "nc -ul ") << port << "\",\n";
+            topology << "  \"notes\": \"Packets are generated inside ns-3 and sent outward toward the Linux TAP. Traffic does not enter from TAP first.\"\n";
+            topology << "}\n";
+        }
+    }
 
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();

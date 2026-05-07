@@ -1,0 +1,72 @@
+{
+  "coordinate": {
+    "coordinate_index": 5,
+    "x": -38.280166659976004,
+    "y": -22.232990083430202,
+    "z": 1.5,
+    "time_seconds": "6.0",
+    "vehicle_id": "car_1"
+  },
+  "transport": "tcp",
+  "tcpVariant": "TcpNewReno",
+  "packetSize": 512,
+  "maxBytes": 0,
+  "appStart": 1.0,
+  "appStop": 20.0,
+  "effectiveAppStop": 19.0,
+  "port": 9000,
+  "ns3_execution_mode": "single_trajectory_run",
+  "uePositionInterval": 0.9,
+  "uePositionStartTime": 1.0,
+  "shared_ns3_raw_dir": "results/sionna_ns3_experiment_20260507_012424/raw",
+  "tap": {
+    "enabled": true,
+    "tapName": "tap0",
+    "tapMode": "UseLocal"
+  },
+  "sionna_artifacts": {},
+  "visualization": {
+    "warnings": [
+      "No Sionna summary row found"
+    ]
+  },
+  "tcp_trace_files_generated": {
+    "cwnd": true,
+    "rtt": true,
+    "retransmissions": true
+  },
+  "warnings": [
+    "TCP/TAP appStop was internally adjusted from 20.0 to 19.0 so ns-3 can send TCP close/ACK packets before simTime=20.0."
+  ],
+  "sionna_post_traffic_export": {
+    "enabled": true,
+    "returncode": 0,
+    "artifacts": {
+      "sionna_raw.json": "results/sionna_ns3_experiment_20260507_012424/coord_005_x_m38p280166659976004_y_m22p232990083430202_z_1p5/raw/sionna_raw.json",
+      "sionna_scene.png": "results/sionna_ns3_experiment_20260507_012424/coord_005_x_m38p280166659976004_y_m22p232990083430202_z_1p5/raw/sionna_scene.png",
+      "sionna_grid.png": "results/sionna_ns3_experiment_20260507_012424/coord_005_x_m38p280166659976004_y_m22p232990083430202_z_1p5/raw/sionna_grid.png",
+      "sionna_stats.png": "results/sionna_ns3_experiment_20260507_012424/coord_005_x_m38p280166659976004_y_m22p232990083430202_z_1p5/raw/sionna_stats.png",
+      "sionna_path_gain_db.npy": "results/sionna_ns3_experiment_20260507_012424/coord_005_x_m38p280166659976004_y_m22p232990083430202_z_1p5/raw/sionna_path_gain_db.npy"
+    },
+    "visualization": {
+      "sionna_scene_generated": true,
+      "sionna_grid_generated": true,
+      "scene_resolution": [
+        1920,
+        1080
+      ],
+      "grid_resolution": [
+        2240,
+        1600
+      ],
+      "sumo_path_overlay_applied": true,
+      "tx_marker_drawn": true,
+      "current_rx_marker_drawn": true,
+      "warnings": [],
+      "camera_mode": "birdseye",
+      "birdseye_camera_used": true
+    },
+    "radio_map_summary_rows_seen": 1,
+    "reason": "Generated after TCP/TAP route so heavy heatmap export does not block live traffic."
+  }
+}

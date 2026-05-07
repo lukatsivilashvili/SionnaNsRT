@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run per-coordinate ns-3/Sionna TCP experiments and generate real plots."""
+"""Run one ns-3/Sionna TCP trajectory experiment and generate real plots."""
 
 from __future__ import annotations
 
@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--simTime", type=float, default=10.0)
     p.add_argument("--port", type=int, default=9000)
     p.add_argument("--enable-tap", action="store_true", help="Enable ns-3 TapBridge so Linux tcpdump can observe TAP-side packets")
+    p.add_argument("--enableTap", choices=["true", "false"], help="ns-3 style alias for --enable-tap")
+    p.add_argument("--tapName", default="tap0")
     p.add_argument("--enable-tcpdump", action="store_true", help="Start tcpdump from this runner for the whole experiment")
     p.add_argument("--tcpdump-interface", default="any")
     p.add_argument("--sumo-cnam-route", action="store_true")
@@ -53,8 +55,8 @@ def parse_args() -> argparse.Namespace:
         sionna="true",
         shutdownSionna="false",
         ns3_program="sionna-ns3-to-linux-tap",
-        tap_name="sionna-tap0",
-        tap_mode="ConfigureLocal",
+        tap_mode="UseLocal",
+        tap_mac="02:00:00:00:02:02",
         enable_ns3_pcap=False,
         tcpdump_binary="tcpdump",
         tcpdump_filter=None,
@@ -80,7 +82,11 @@ def parse_args() -> argparse.Namespace:
         radio_map_resolution=[1920, 1080],
         radio_map_camera_mode="birdseye",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.enableTap is not None:
+        args.enable_tap = args.enableTap == "true"
+    args.tap_name = args.tapName
+    return args
 
 
 def new_run_root(output_root: Path) -> Path:
@@ -523,10 +529,11 @@ def make_trajectory_metrics(coords: list[dict], summaries: list[dict], args: arg
         "sumo_skip_steps": args.sumo_skip_steps,
         "sumo_max_coordinates": args.sumo_max_coordinates,
         "sionna_recomputed_per_sampled_position": bool(rows) and all(bool(s.get("sionna_recomputed_for_step")) for s in summaries),
-        "sionna_evaluation_mode": "loop_per_sample_via_ns3_position_update_and_on_request_radio_map_export",
+        "sionna_evaluation_mode": "single_ns3_trajectory_run_with_scheduled_ue_position_updates_and_on_request_radio_map_exports",
         "los_detection_available": any(row["los_available"] is True for row in rows),
-        "ns3_run_per_step": True,
-        "ns3_flowmonitor_metrics_are_per_step": True,
+        "ns3_run_per_step": False,
+        "ns3_flowmonitor_metrics_are_per_step": False,
+        "ns3_packet_summary_metrics_are_per_step": True,
         "warnings": sorted(warnings),
     }
     return rows, metadata
@@ -787,6 +794,154 @@ def stop_tcpdump(process: subprocess.Popen | None, meta: dict) -> dict:
     return meta
 
 
+def start_host_tcp_sink(args: argparse.Namespace, run_root: Path) -> tuple[subprocess.Popen | None, dict]:
+    meta = {
+        "enabled": args.enable_tap and args.transport == "tcp",
+        "status": "disabled",
+        "bind_ip": "0.0.0.0",
+        "tap_destination_ip": "10.10.2.2",
+        "port": args.port,
+        "stdout_log": "",
+        "stderr_log": "",
+        "payload_file": "",
+        "ready_file": "",
+        "warnings": [],
+    }
+    if not meta["enabled"]:
+        return None, meta
+
+    raw_root = run_root / "raw"
+    raw_root.mkdir(exist_ok=True)
+    stdout_path = raw_root / "host_tcp_sink_stdout.log"
+    stderr_path = raw_root / "host_tcp_sink_stderr.log"
+    payload_path = raw_root / "host_tcp_sink_payload.bin"
+    ready_path = raw_root / "host_tcp_sink.ready"
+    meta.update({
+        "stdout_log": str(stdout_path),
+        "stderr_log": str(stderr_path),
+        "payload_file": str(payload_path),
+        "ready_file": str(ready_path),
+    })
+    try:
+        ready_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    code = r'''
+import pathlib
+import signal
+import socket
+import sys
+import time
+
+bind_ip = sys.argv[1]
+port = int(sys.argv[2])
+payload_path = pathlib.Path(sys.argv[3])
+ready_path = pathlib.Path(sys.argv[4])
+duration = float(sys.argv[5])
+stop = False
+
+def handle_stop(_signum, _frame):
+    global stop
+    stop = True
+
+signal.signal(signal.SIGTERM, handle_stop)
+signal.signal(signal.SIGINT, handle_stop)
+payload_path.parent.mkdir(parents=True, exist_ok=True)
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind((bind_ip, port))
+server.listen(8)
+server.settimeout(0.5)
+ready_path.write_text("ready\n", encoding="utf-8")
+print(f"READY host TCP sink listening on {bind_ip}:{port}", flush=True)
+deadline = time.time() + duration
+total_connections = 0
+total_bytes = 0
+with payload_path.open("ab") as payload:
+    while not stop and time.time() < deadline:
+        try:
+            conn, address = server.accept()
+        except socket.timeout:
+            continue
+        total_connections += 1
+        print(f"ACCEPT {address[0]}:{address[1]}", flush=True)
+        conn.settimeout(0.5)
+        with conn:
+            while not stop:
+                try:
+                    data = conn.recv(65535)
+                except socket.timeout:
+                    if time.time() >= deadline:
+                        break
+                    continue
+                if not data:
+                    break
+                payload.write(data)
+                payload.flush()
+                total_bytes += len(data)
+                print(f"RX bytes={len(data)} total_bytes={total_bytes}", flush=True)
+print(f"DONE connections={total_connections} bytes={total_bytes}", flush=True)
+server.close()
+'''
+    stdout = stdout_path.open("w", encoding="utf-8")
+    stderr = stderr_path.open("w", encoding="utf-8")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+            "0.0.0.0",
+            str(args.port),
+            str(payload_path),
+            str(ready_path),
+            "3600",
+        ],
+        stdout=stdout,
+        stderr=stderr,
+        text=True,
+        preexec_fn=os.setsid,
+    )
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if ready_path.exists():
+            meta["status"] = "running"
+            meta["pid"] = process.pid
+            return process, meta
+        if process.poll() is not None:
+            meta["status"] = "exited_early"
+            meta["returncode"] = process.returncode
+            meta["warnings"].append(
+                "Host TCP sink exited before becoming ready. Close any existing 'nc -l 9000' or process using port 9000."
+            )
+            return None, meta
+        time.sleep(0.1)
+    meta["status"] = "not_ready"
+    meta["warnings"].append("Host TCP sink did not become ready within 5 seconds")
+    return process, meta
+
+
+def stop_host_tcp_sink(process: subprocess.Popen | None, meta: dict) -> dict:
+    if process is None:
+        return meta
+    if process.poll() is None:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            meta.setdefault("warnings", []).append("Host TCP sink did not exit on SIGTERM; killing")
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            process.wait(timeout=5)
+    meta["status"] = "completed"
+    meta["returncode"] = process.returncode
+    payload_path = Path(meta.get("payload_file", ""))
+    if payload_path.exists():
+        meta["received_payload_bytes"] = payload_path.stat().st_size
+    return meta
+
+
 def start_sudo_keepalive(enabled: bool, sudo_password: str | None) -> subprocess.Popen | None:
     if not enabled:
         return None
@@ -821,6 +976,88 @@ def stop_sudo_keepalive(process: subprocess.Popen | None) -> None:
             pass
 
 
+def sudo_run(command: list[str], sudo_password: str | None, check: bool = True) -> subprocess.CompletedProcess:
+    full_command = ["sudo", "-S", *command] if sudo_password else ["sudo", "-n", *command]
+    return subprocess.run(
+        full_command,
+        input=(sudo_password + "\n") if sudo_password else None,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+    )
+
+
+def ensure_persistent_tap(args: argparse.Namespace, sudo_password: str | None, run_root: Path) -> dict:
+    meta = {
+        "enabled": args.enable_tap,
+        "tap_name": args.tap_name,
+        "tap_mode": args.tap_mode,
+        "host_ip": "10.10.2.2/24",
+        "tap_mac": args.tap_mac,
+        "status": "disabled",
+        "commands": [],
+        "warnings": [],
+    }
+    if not args.enable_tap:
+        return meta
+    if args.tap_mode != "UseLocal":
+        meta["status"] = "not_managed"
+        meta["warnings"].append("Persistent TAP management is only used with tapMode=UseLocal")
+        return meta
+
+    commands = [
+        ["ip", "tuntap", "add", "dev", args.tap_name, "mode", "tap", "user", os.environ.get("USER", "")],
+        ["ip", "link", "set", "dev", args.tap_name, "down"],
+        ["ip", "link", "set", "dev", args.tap_name, "address", args.tap_mac],
+        ["ip", "addr", "flush", "dev", args.tap_name],
+        ["ip", "addr", "add", "10.10.2.2/24", "dev", args.tap_name],
+        ["ip", "link", "set", args.tap_name, "up"],
+        ["ip", "route", "replace", "7.0.0.0/8", "via", "10.10.2.1", "dev", args.tap_name],
+        ["sysctl", "-w", f"net.ipv4.conf.{args.tap_name}.rp_filter=0"],
+        ["sysctl", "-w", "net.ipv4.conf.all.rp_filter=0"],
+    ]
+    for command in commands:
+        if "" in command:
+            command.remove("")
+        meta["commands"].append(" ".join(command))
+        result = sudo_run(command, sudo_password, check=False)
+        already_exists = "File exists" in result.stderr or "Device or resource busy" in result.stderr
+        if result.returncode != 0 and command[:3] == ["ip", "tuntap", "add"] and already_exists:
+            continue
+        if result.returncode != 0:
+            meta["status"] = "failed"
+            meta["warnings"].append(f"{' '.join(command)} failed: {result.stderr.strip()}")
+            (run_root / "tap_metadata.json").write_text(json.dumps(meta, indent=2))
+            return meta
+
+    meta["status"] = "ready"
+    firewall_rules = [
+        ["iptables", "-C", "INPUT", "-i", args.tap_name, "-p", args.transport, "--dport", str(args.port), "-j", "ACCEPT"],
+        ["iptables", "-I", "INPUT", "1", "-i", args.tap_name, "-p", args.transport, "--dport", str(args.port), "-j", "ACCEPT"],
+        ["iptables", "-C", "OUTPUT", "-o", args.tap_name, "-p", args.transport, "--sport", str(args.port), "-j", "ACCEPT"],
+        ["iptables", "-I", "OUTPUT", "1", "-o", args.tap_name, "-p", args.transport, "--sport", str(args.port), "-j", "ACCEPT"],
+    ]
+    meta["firewall_rules"] = []
+    input_check = sudo_run(firewall_rules[0], sudo_password, check=False)
+    meta["firewall_rules"].append(" ".join(firewall_rules[0]))
+    if input_check.returncode != 0:
+        input_insert = sudo_run(firewall_rules[1], sudo_password, check=False)
+        meta["firewall_rules"].append(" ".join(firewall_rules[1]))
+        if input_insert.returncode != 0:
+            meta["warnings"].append(f"Could not insert INPUT accept rule: {input_insert.stderr.strip()}")
+    output_check = sudo_run(firewall_rules[2], sudo_password, check=False)
+    meta["firewall_rules"].append(" ".join(firewall_rules[2]))
+    if output_check.returncode != 0:
+        output_insert = sudo_run(firewall_rules[3], sudo_password, check=False)
+        meta["firewall_rules"].append(" ".join(firewall_rules[3]))
+        if output_insert.returncode != 0:
+            meta["warnings"].append(f"Could not insert OUTPUT accept rule: {output_insert.stderr.strip()}")
+    meta["notes"] = "tap0 is created once before the single ns-3 trajectory run and remains present for the whole route."
+    (run_root / "tap_metadata.json").write_text(json.dumps(meta, indent=2))
+    return meta
+
+
 def get_sudo_password_once(args: argparse.Namespace) -> str | None:
     needs_sudo = args.enable_tap or (args.enable_tcpdump and args.tcpdump_use_sudo)
     if not needs_sudo:
@@ -849,6 +1086,367 @@ def coord_dir_name(i: int, row: dict) -> str:
     return f"coord_{i:03d}_x_{clean(row['x'])}_y_{clean(row['y'])}_z_{clean(row['z'])}"
 
 
+def positions_arg(coords: list[dict]) -> str:
+    return ";".join(f"{row['x']},{row['y']},{row['z']}" for row in coords)
+
+
+def write_positions_file(path: Path, coords: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(f"{row['x']},{row['y']},{row['z']}" for row in coords) + "\n", encoding="utf-8")
+
+
+def parse_packet_summary(path: Path) -> dict[int, dict]:
+    rows: dict[int, dict] = {}
+    for row in read_csv_rows(path):
+        index = int(float(row.get("index", 0)))
+        txp = int(float(row.get("app_tx_packets") or 0))
+        rxp = int(float(row.get("tap_side_rx_packets") or 0))
+        txb = int(float(row.get("app_tx_bytes") or 0))
+        rxb = int(float(row.get("tap_side_rx_bytes") or 0))
+        start = float(row.get("window_start_s") or 0.0)
+        end = float(row.get("window_end_s") or start)
+        duration = max(end - start, 1e-9)
+        rows[index] = {
+            "txPackets": txp,
+            "rxPackets": rxp,
+            "lostPackets": max(txp - rxp, 0),
+            "txBytes": txb,
+            "rxBytes": rxb,
+            "throughput_mbps": rxb * 8.0 / duration / 1e6,
+            "packet_delivery_ratio": rxp / txp if txp else 0.0,
+            "packet_loss_ratio": max(txp - rxp, 0) / txp if txp else 0.0,
+            "average_delay_ms": "",
+            "average_jitter_ms": "",
+            "packet_window_start_s": start,
+            "packet_window_end_s": end,
+            "mean_tap_side_rx_interarrival_s": float_or_blank(row.get("mean_tap_side_rx_interarrival_s")),
+        }
+    return rows
+
+
+def tcp_tap_effective_app_stop(args: argparse.Namespace) -> tuple[float, list[str]]:
+    warnings = []
+    effective_app_stop = args.appStop
+    if args.transport == "tcp" and args.enable_tap and args.appStop >= args.simTime:
+        close_margin = 1.0
+        minimum_stop = args.appStart + 0.5
+        effective_app_stop = max(minimum_stop, args.simTime - close_margin)
+        if effective_app_stop < args.appStop:
+            warnings.append(
+                f"TCP/TAP appStop was internally adjusted from {args.appStop} to "
+                f"{effective_app_stop} so ns-3 can send TCP close/ACK packets before simTime={args.simTime}."
+            )
+    return effective_app_stop, warnings
+
+
+def run_command_streamed(command: list[str], stdout_path: Path, stderr_path: Path, env: dict) -> int:
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
+    with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
+        stderr_file.write("stderr was merged into ns3_stdout.log so mobility updates are visible live in the main terminal.\n")
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        assert process.stdout is not None
+        while True:
+            line = process.stdout.readline()
+            if line:
+                print(line, end="", flush=True)
+                stdout_file.write(line)
+                stdout_file.flush()
+            if not line and process.poll() is not None:
+                break
+        return process.wait()
+
+
+def copy_sionna_artifacts_for_coord(raw: Path, sionna: dict) -> tuple[dict, dict]:
+    sionna_artifacts = {}
+    visualization = {
+        "sionna_scene_generated": False,
+        "sionna_grid_generated": False,
+        "scene_resolution": "",
+        "grid_resolution": "",
+        "sumo_path_overlay_applied": False,
+        "tx_marker_drawn": False,
+        "current_rx_marker_drawn": False,
+        "warnings": [],
+    }
+    artifact_map = {
+        "metadata_json": "sionna_raw.json",
+        "scene_png": "sionna_scene.png",
+        "grid_png": "sionna_grid.png",
+        "stats_png": "sionna_stats.png",
+        "path_gain_db_npy": "sionna_path_gain_db.npy",
+    }
+    for column, filename in artifact_map.items():
+        source = sionna.get(column)
+        if source and Path(source).exists():
+            shutil.copy2(source, raw / filename)
+            sionna_artifacts[filename] = str(raw / filename)
+    metadata_source = raw / "sionna_raw.json"
+    if metadata_source.exists():
+        try:
+            sionna_meta = json.loads(metadata_source.read_text(encoding="utf-8"))
+            visualization_meta = sionna_meta.get("visualization", {})
+            visualization.update({
+                "sionna_scene_generated": bool((raw / "sionna_scene.png").exists()),
+                "sionna_grid_generated": bool((raw / "sionna_grid.png").exists()),
+                "scene_resolution": visualization_meta.get("scene_resolution", ""),
+                "grid_resolution": visualization_meta.get("grid_resolution", ""),
+                "sumo_path_overlay_applied": bool(visualization_meta.get("route_overlay_applied")),
+                "tx_marker_drawn": bool(visualization_meta.get("tx_marker_drawn")),
+                "current_rx_marker_drawn": bool(visualization_meta.get("current_rx_marker_drawn")),
+                "camera_mode": visualization_meta.get("camera_mode", ""),
+                "birdseye_camera_used": visualization_meta.get("camera_mode") == "birdseye",
+            })
+            visualization["warnings"].extend(visualization_meta.get("warnings", []))
+        except (OSError, json.JSONDecodeError) as exc:
+            visualization["warnings"].append(f"Could not read Sionna visualization metadata: {exc}")
+    else:
+        visualization["warnings"].append("Sionna metadata JSON was not copied")
+    return sionna_artifacts, visualization
+
+
+def run_trajectory_once(args: argparse.Namespace, coords: list[dict], run_root: Path, sudo_password: str | None = None) -> list[dict]:
+    raw_root = run_root / "raw"
+    raw_root.mkdir(exist_ok=True)
+    before_sionna_rows = count_csv_rows(args.radio_map_summary_csv)
+    flowmon = raw_root / "flowmon.xml"
+    packet_summary_file = raw_root / "packet_summary.csv"
+    ue_positions_file = raw_root / "ue_positions.txt"
+    write_positions_file(ue_positions_file, coords)
+    effective_app_stop, app_stop_warnings = tcp_tap_effective_app_stop(args)
+    ue_position_interval = max((effective_app_stop - args.appStart) / max(len(coords), 1), 1e-6)
+    ns3_args = [
+        f"--transport={args.transport}", f"--tcpVariant={args.tcpVariant}",
+        f"--packetSize={args.packetSize}", f"--maxBytes={args.maxBytes}",
+        f"--appStart={args.appStart}", f"--appStop={effective_app_stop}", f"--simTime={args.simTime}",
+        f"--port={args.port}", f"--sionna={args.sionna}", f"--shutdownSionna={args.shutdownSionna}",
+        f"--enableTap={'true' if args.enable_tap else 'false'}",
+        f"--tapMode={args.tap_mode}",
+        f"--tapName={args.tap_name}",
+        f"--tapMac={args.tap_mac}",
+        f"--enablePcap={'true' if args.enable_ns3_pcap else 'false'}",
+        "--trafficApp=OnOff",
+        "--dataRate=4096kbps",
+        "--enableSystemTapPcap=false",
+        "--enableFlowMonitor=true",
+        "--enablePacketSummary=true",
+        "--enableUePositionSequence=true",
+        f"--uePositionStartTime={args.appStart}",
+        f"--uePositionInterval={ue_position_interval}",
+        f"--uePositionsFile={ue_positions_file}",
+        "--enableSionnaExportSequence=false",
+        f"--sionnaExportPort={args.sionna_port}",
+        f"--flowMonitorFile={flowmon}",
+        f"--packetSummaryFile={packet_summary_file}",
+        f"--pcapPrefix={raw_root / 'ns3_csma'}",
+        f"--tcpCwndFile={raw_root / 'tcp_cwnd.csv'}",
+        f"--tcpRttFile={raw_root / 'tcp_rtt.csv'}",
+        f"--tcpRetransmissionsFile={raw_root / 'tcp_retransmissions.csv'}",
+        f"--topologyMetadataFile={raw_root / 'ns3_to_tap_topology.json'}",
+    ]
+    cmd = ["./ns3", "run"]
+    if args.enable_tap:
+        cmd.append("--enable-sudo")
+    cmd.append(f"{args.ns3_program} {' '.join(shlex.quote(a) for a in ns3_args)}")
+    env = os.environ.copy()
+    if sudo_password:
+        env["SUDO_PASSWORD"] = sudo_password
+    if app_stop_warnings:
+        for warning in app_stop_warnings:
+            print(f"Warning: {warning}")
+    print("ns-3 TCP traffic app: OnOffApplication at 4096kbps for continuous route traffic", flush=True)
+    print("Sionna radio-map image exports are disabled during active TCP traffic to avoid blocking the real-time simulator", flush=True)
+    print("Scheduled ns-3 UE/SUMO positions:")
+    for i, coord in enumerate(coords):
+        move_time = args.appStart if i == 0 else args.appStart + i * ue_position_interval
+        print(
+            f"  [{i + 1}/{len(coords)}] t={move_time:.3f}s "
+            f"x={coord['x']} y={coord['y']} z={coord['z']}",
+            flush=True,
+        )
+    returncode = run_command_streamed(cmd, raw_root / "ns3_stdout.log", raw_root / "ns3_stderr.log", env)
+    if returncode != 0:
+        raise RuntimeError(f"single ns-3 trajectory run failed; see {raw_root / 'ns3_stderr.log'}")
+
+    packet_rows = parse_packet_summary(packet_summary_file)
+    aggregate_flowmon = parse_flowmon(flowmon, args.port, args.appStart, effective_app_stop)
+    sionna_rows_after = read_csv_rows(args.radio_map_summary_csv)
+    if len(sionna_rows_after) >= before_sionna_rows:
+        sionna_new = sionna_rows_after[before_sionna_rows:]
+    else:
+        sionna_new = sionna_rows_after
+
+    cwnd = parse_tcp_trace(raw_root / "tcp_cwnd.csv", "new_cwnd_bytes")
+    rtt = parse_tcp_trace(raw_root / "tcp_rtt.csv", "new_rtt_ms")
+    states = parse_tcp_trace(raw_root / "tcp_retransmissions.csv", "new_congestion_state")
+    tcp = {
+        "retransmissions": len([v for v in states if v > 0]),
+        "average_rtt_ms": sum(rtt) / len(rtt) if rtt else "",
+        "final_cwnd": cwnd[-1] if cwnd else "",
+        "average_cwnd": sum(cwnd) / len(cwnd) if cwnd else "",
+    }
+
+    summaries = []
+    for i, coord in enumerate(coords):
+        cdir = run_root / coord_dir_name(i, coord)
+        raw, parsed = cdir / "raw", cdir / "parsed"
+        raw.mkdir(parents=True, exist_ok=True)
+        parsed.mkdir(exist_ok=True)
+        ns3 = packet_rows.get(i, aggregate_flowmon)
+        sionna = find_sionna_row_for_coord(sionna_rows_after, coord) or (sionna_new[i] if i < len(sionna_new) else {})
+        if sionna:
+            write_rows(parsed / "sionna_metrics.csv", [sionna])
+            sionna_artifacts, sionna_visualization = copy_sionna_artifacts_for_coord(raw, sionna)
+        else:
+            write_rows(parsed / "sionna_metrics.csv", [{"coordinate_index": i, "note": "No Sionna summary row found"}])
+            sionna_artifacts = {}
+            sionna_visualization = {"warnings": ["No Sionna summary row found"]}
+
+        summary = {
+            "coordinate_index": i, "time_seconds": coord.get("time_seconds", ""), "vehicle_id": coord.get("vehicle_id", ""),
+            "x": coord["x"], "y": coord["y"], "z": coord["z"],
+            "transport": args.transport, "tcp_variant": args.tcpVariant,
+            **ns3,
+            "rss_dbm": "",
+            "path_gain_db": "",
+            "sinr_db": "",
+            "valid_paths": "",
+            "distance_from_tx_m": "",
+            "los_available": False,
+            "los_present": "",
+            "valid_paths_count": "",
+            "strongest_path_delay_ns": "",
+            "sionna_recomputed_for_step": False,
+            **tcp,
+            "returncode": returncode,
+        }
+        if sionna:
+            apply_sionna_to_summary(summary, sionna)
+        write_rows(parsed / "ns3_metrics.csv", [ns3])
+        write_rows(parsed / "tcp_metrics.csv", [tcp])
+        write_rows(parsed / "paths_metrics.csv", [{"coordinate_index": i, "valid_paths": summary["valid_paths"]}])
+        (cdir / "metadata.json").write_text(json.dumps({
+            "coordinate": coord,
+            "transport": args.transport,
+            "tcpVariant": args.tcpVariant,
+            "packetSize": args.packetSize,
+            "maxBytes": args.maxBytes,
+            "appStart": args.appStart,
+            "appStop": args.appStop,
+            "effectiveAppStop": effective_app_stop,
+            "port": args.port,
+            "ns3_execution_mode": "single_trajectory_run",
+            "uePositionInterval": ue_position_interval,
+            "uePositionStartTime": args.appStart,
+            "shared_ns3_raw_dir": str(raw_root),
+            "tap": {"enabled": args.enable_tap, "tapName": args.tap_name, "tapMode": args.tap_mode},
+            "sionna_artifacts": sionna_artifacts,
+            "visualization": sionna_visualization,
+            "tcp_trace_files_generated": {"cwnd": bool(cwnd), "rtt": bool(rtt), "retransmissions": bool(states)},
+            "warnings": app_stop_warnings,
+        }, indent=2))
+        summaries.append(summary)
+    return summaries
+
+
+def apply_sionna_to_summary(summary: dict, sionna: dict) -> None:
+    summary.update({
+        "rss_dbm": float_or_blank(sionna.get("rx_power_dbm")),
+        "path_gain_db": float_or_blank(sionna.get("rx_nearest_path_gain_db")),
+        "sinr_db": float_or_blank(sionna.get("snr_db")),
+        "valid_paths": 1 if sionna.get("los_status") == "True" else "",
+        "distance_from_tx_m": float_or_blank(sionna.get("tx_rx_distance_m")),
+        "los_available": sionna.get("los_status") not in ("", None),
+        "los_present": sionna.get("los_status") == "True",
+        "valid_paths_count": 1 if sionna.get("los_status") == "True" else 0 if sionna.get("los_status") in ("False", "None") else "",
+        "strongest_path_delay_ns": (
+            float(sionna["ray_one_way_delay_s"]) * 1e9
+            if float_or_blank(sionna.get("ray_one_way_delay_s")) != "" else ""
+        ),
+        "sionna_recomputed_for_step": bool(sionna),
+    })
+
+
+def run_sionna_visual_export_pass(args: argparse.Namespace, coords: list[dict], run_root: Path, summaries: list[dict]) -> None:
+    if not (args.start_sionna_server and args.sionna == "true"):
+        return
+    print("[post-run Sionna export] generating per-coordinate heatmaps and raw artifacts", flush=True)
+    for i, coord in enumerate(coords):
+        cdir = run_root / coord_dir_name(i, coord)
+        raw, parsed = cdir / "raw", cdir / "parsed"
+        raw.mkdir(parents=True, exist_ok=True)
+        parsed.mkdir(exist_ok=True)
+        pos_file = raw / "sionna_export_position.txt"
+        write_positions_file(pos_file, [coord])
+        before_sionna_rows = count_csv_rows(args.radio_map_summary_csv)
+        ns3_args = [
+            "--transport=udp",
+            "--packetSize=64",
+            "--maxBytes=1",
+            "--appStart=0.2",
+            "--appStop=1.0",
+            "--simTime=1.5",
+            f"--port={args.port}",
+            "--sionna=true",
+            "--shutdownSionna=false",
+            "--enableTap=false",
+            "--enablePcap=false",
+            "--enableSystemTapPcap=false",
+            "--enableFlowMonitor=false",
+            "--enablePacketSummary=false",
+            "--enableTcpTraces=false",
+            "--enableUePositionSequence=false",
+            "--uePositionStartTime=0.2",
+            f"--uePositionsFile={pos_file}",
+            "--enableSionnaExportSequence=true",
+            f"--sionnaExportPort={args.sionna_port}",
+            "--sionnaExportDelay=0.1",
+            f"--topologyMetadataFile={raw / 'sionna_export_topology.json'}",
+        ]
+        cmd = ["./ns3", "run", f"{args.ns3_program} {' '.join(shlex.quote(a) for a in ns3_args)}"]
+        print(f"  [{i + 1}/{len(coords)}] export x={coord['x']} y={coord['y']} z={coord['z']}", flush=True)
+        returncode = run_command_streamed(cmd, raw / "sionna_export_stdout.log", raw / "sionna_export_stderr.log", os.environ.copy())
+        if returncode != 0:
+            write_rows(parsed / "sionna_metrics.csv", [{"coordinate_index": i, "note": "Sionna export ns-3 pass failed"}])
+            continue
+
+        sionna_rows_after = read_csv_rows(args.radio_map_summary_csv)
+        if len(sionna_rows_after) >= before_sionna_rows:
+            sionna_new = sionna_rows_after[before_sionna_rows:]
+        else:
+            sionna_new = sionna_rows_after
+        sionna = find_sionna_row_for_coord(sionna_rows_after, coord) or (sionna_new[-1] if sionna_new else {})
+        if sionna:
+            write_rows(parsed / "sionna_metrics.csv", [sionna])
+            sionna_artifacts, sionna_visualization = copy_sionna_artifacts_for_coord(raw, sionna)
+            apply_sionna_to_summary(summaries[i], sionna)
+        else:
+            write_rows(parsed / "sionna_metrics.csv", [{"coordinate_index": i, "note": "No Sionna summary row found after post-run export"}])
+            sionna_artifacts = {}
+            sionna_visualization = {"warnings": ["No Sionna summary row found after post-run export"]}
+
+        metadata_path = cdir / "metadata.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+        except json.JSONDecodeError:
+            metadata = {}
+        metadata["sionna_post_traffic_export"] = {
+            "enabled": True,
+            "returncode": returncode,
+            "artifacts": sionna_artifacts,
+            "visualization": sionna_visualization,
+            "radio_map_summary_rows_seen": len(sionna_new),
+            "reason": "Generated after TCP/TAP route so heavy heatmap export does not block live traffic.",
+        }
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
 def run_one(args: argparse.Namespace, coord: dict, i: int, run_root: Path, sudo_password: str | None = None) -> dict:
     cdir = run_root / coord_dir_name(i, coord)
     raw, parsed = cdir / "raw", cdir / "parsed"
@@ -865,6 +1463,7 @@ def run_one(args: argparse.Namespace, coord: dict, i: int, run_root: Path, sudo_
         f"--enableTap={'true' if args.enable_tap else 'false'}",
         f"--tapMode={args.tap_mode}",
         f"--tapName={args.tap_name}",
+        f"--tapMac={args.tap_mac}",
         f"--enablePcap={'true' if args.enable_ns3_pcap else 'false'}",
         "--enableSystemTapPcap=false",
         "--enableFlowMonitor=true",
@@ -873,11 +1472,12 @@ def run_one(args: argparse.Namespace, coord: dict, i: int, run_root: Path, sudo_
         f"--pcapPrefix={raw / 'ns3_csma'}",
         f"--tcpCwndFile={raw / 'tcp_cwnd.csv'}", f"--tcpRttFile={raw / 'tcp_rtt.csv'}",
         f"--tcpRetransmissionsFile={raw / 'tcp_retransmissions.csv'}",
+        f"--topologyMetadataFile={raw / 'ns3_to_tap_topology.json'}",
     ]
     cmd = ["./ns3", "run"]
     if args.enable_tap:
         cmd.append("--enable-sudo")
-    cmd.append(f"{args.ns3_program} {' '.join(ns3_args)}")
+    cmd.append(f"{args.ns3_program} {' '.join(shlex.quote(a) for a in ns3_args)}")
     env = os.environ.copy()
     if sudo_password:
         env["SUDO_PASSWORD"] = sudo_password
@@ -1034,9 +1634,12 @@ def main() -> int:
 
     sionna_process = None
     tcpdump_process = None
+    host_tcp_sink_process = None
     sudo_keepalive_process = None
     sudo_password = None
     tcpdump_meta = {"enabled": args.enable_tcpdump, "status": "not_started"}
+    host_tcp_sink_meta = {"enabled": args.enable_tap and args.transport == "tcp", "status": "not_started"}
+    tap_meta = {"enabled": args.enable_tap, "status": "not_started"}
     if args.start_sionna_server:
         args.sionna = "true"
         sionna_process = start_sionna_server(args, run_root, sumo_path)
@@ -1044,14 +1647,26 @@ def main() -> int:
         print("Warning: --enable-tcpdump without --enable-tap may not see ns-3 data packets on a Linux TAP.", file=sys.stderr)
     sudo_password = get_sudo_password_once(args)
     sudo_keepalive_process = start_sudo_keepalive(args.enable_tap or (args.enable_tcpdump and args.tcpdump_use_sudo), sudo_password)
+    tap_meta = ensure_persistent_tap(args, sudo_password, run_root)
+    if tap_meta.get("status") == "failed":
+        raise RuntimeError("Failed to create/configure persistent TAP; see tap_metadata.json")
+    host_tcp_sink_process, host_tcp_sink_meta = start_host_tcp_sink(args, run_root)
+    (run_root / "host_tcp_sink_metadata.json").write_text(json.dumps(host_tcp_sink_meta, indent=2, default=str))
+    if host_tcp_sink_meta.get("enabled") and host_tcp_sink_meta.get("status") != "running":
+        raise RuntimeError("Failed to start host TCP sink; close nc/listeners on port 9000 and see host_tcp_sink_metadata.json")
     tcpdump_process, tcpdump_meta = start_tcpdump(args, run_root, sudo_password)
     (run_root / "tcpdump_metadata.json").write_text(json.dumps(tcpdump_meta, indent=2, default=str))
 
     try:
-        summaries = []
-        for i, coord in enumerate(coords):
-            print(f"[{i + 1}/{len(coords)}] x={coord['x']} y={coord['y']} z={coord['z']}")
-            summaries.append(run_one(args, coord, i, run_root, sudo_password))
+        print(f"[single ns-3 trajectory run] {len(coords)} sampled RX positions")
+        summaries = run_trajectory_once(args, coords, run_root, sudo_password)
+        tcpdump_meta = stop_tcpdump(tcpdump_process, tcpdump_meta)
+        tcpdump_process = None
+        (run_root / "tcpdump_metadata.json").write_text(json.dumps(tcpdump_meta, indent=2, default=str))
+        host_tcp_sink_meta = stop_host_tcp_sink(host_tcp_sink_process, host_tcp_sink_meta)
+        host_tcp_sink_process = None
+        (run_root / "host_tcp_sink_metadata.json").write_text(json.dumps(host_tcp_sink_meta, indent=2, default=str))
+        run_sionna_visual_export_pass(args, coords, run_root, summaries)
         write_rows(run_root / "summary.csv", summaries)
         (run_root / "summary.json").write_text(json.dumps(summaries, indent=2))
 
@@ -1087,6 +1702,8 @@ def main() -> int:
     finally:
         tcpdump_meta = stop_tcpdump(tcpdump_process, tcpdump_meta)
         (run_root / "tcpdump_metadata.json").write_text(json.dumps(tcpdump_meta, indent=2, default=str))
+        host_tcp_sink_meta = stop_host_tcp_sink(host_tcp_sink_process, host_tcp_sink_meta)
+        (run_root / "host_tcp_sink_metadata.json").write_text(json.dumps(host_tcp_sink_meta, indent=2, default=str))
         stop_sudo_keepalive(sudo_keepalive_process)
         stop_sionna_server(sionna_process)
 

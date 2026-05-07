@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "status": "completed",
+  "bind_ip": "0.0.0.0",
+  "tap_destination_ip": "10.10.2.2",
+  "port": 9000,
+  "stdout_log": "results/sionna_ns3_experiment_20260507_012424/raw/host_tcp_sink_stdout.log",
+  "stderr_log": "results/sionna_ns3_experiment_20260507_012424/raw/host_tcp_sink_stderr.log",
+  "payload_file": "results/sionna_ns3_experiment_20260507_012424/raw/host_tcp_sink_payload.bin",
+  "ready_file": "results/sionna_ns3_experiment_20260507_012424/raw/host_tcp_sink.ready",
+  "warnings": [],
+  "pid": 111483,
+  "returncode": 0,
+  "received_payload_bytes": 307712
+}

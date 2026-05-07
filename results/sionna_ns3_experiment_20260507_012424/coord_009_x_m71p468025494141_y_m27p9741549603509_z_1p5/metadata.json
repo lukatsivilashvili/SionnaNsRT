@@ -1,0 +1,53 @@
+{
+  "coordinate": {
+    "coordinate_index": 9,
+    "x": -71.468025494141,
+    "y": -27.9741549603509,
+    "z": 1.5,
+    "time_seconds": "10.0",
+    "vehicle_id": "car_1"
+  },
+  "transport": "tcp",
+  "tcpVariant": "TcpNewReno",
+  "packetSize": 512,
+  "maxBytes": 0,
+  "appStart": 1.0,
+  "appStop": 20.0,
+  "effectiveAppStop": 19.0,
+  "port": 9000,
+  "ns3_execution_mode": "single_trajectory_run",
+  "uePositionInterval": 0.9,
+  "uePositionStartTime": 1.0,
+  "shared_ns3_raw_dir": "results/sionna_ns3_experiment_20260507_012424/raw",
+  "tap": {
+    "enabled": true,
+    "tapName": "tap0",
+    "tapMode": "UseLocal"
+  },
+  "sionna_artifacts": {},
+  "visualization": {
+    "warnings": [
+      "No Sionna summary row found"
+    ]
+  },
+  "tcp_trace_files_generated": {
+    "cwnd": true,
+    "rtt": true,
+    "retransmissions": true
+  },
+  "warnings": [
+    "TCP/TAP appStop was internally adjusted from 20.0 to 19.0 so ns-3 can send TCP close/ACK packets before simTime=20.0."
+  ],
+  "sionna_post_traffic_export": {
+    "enabled": true,
+    "returncode": 0,
+    "artifacts": {},
+    "visualization": {
+      "warnings": [
+        "No Sionna summary row found after post-run export"
+      ]
+    },
+    "radio_map_summary_rows_seen": 0,
+    "reason": "Generated after TCP/TAP route so heavy heatmap export does not block live traffic."
+  }
+}

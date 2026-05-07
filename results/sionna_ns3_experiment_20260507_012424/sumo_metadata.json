@@ -1,0 +1,12 @@
+{
+  "sumo_config": "results/sionna_ns3_experiment_20260507_012424/sumo_cnam_scenario/cnam.sumocfg",
+  "sumo_cnam_route": true,
+  "sumo_binary": "sumo",
+  "sumo_binary_available": true,
+  "traci_available": true,
+  "sumo_stdout": "Step #0.00 (0ms ?*RT. ?UPS, TraCI: 0ms, vehicles TOT 1 ACT 1 BUF 0)                       \nStep #20.00 (0ms ?*RT. ?UPS, TraCI: 1ms, vehicles TOT 1 ACT 1 BUF 0)                      \nInterrupt signal received, trying to exit gracefully.\n",
+  "sumo_stderr": "Warning: Environment variable SUMO_HOME is not set properly, disabling XML validation. Set 'auto' or 'always' for web lookups.\n",
+  "status": "ok",
+  "coordinate_count": 20,
+  "output_csv": "results/sionna_ns3_experiment_20260507_012424/sumo_coordinates.csv"
+}
